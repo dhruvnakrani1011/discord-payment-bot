@@ -2,6 +2,7 @@ import discord
 import requests
 import re
 import io
+import os
 from PIL import Image
 import pytesseract
 
