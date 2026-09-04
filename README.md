@@ -1,1 +1,4 @@
-# discord-payment-bot
+discord.py
+requests
+pytesseract
+Pillow
