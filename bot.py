@@ -1,14 +1,13 @@
-import os
+import discord
+from discord.ext import commands
+import requests
+from PIL import Image
+import easyocr
+import numpy as np
+import torch
 import re
 import io
-import asyncio
-from collections import Counter
-
-import discord
-import requests
-import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter
-import easyocr
+import os
 
 import numpy as np
 
