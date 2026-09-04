@@ -1,40 +1,19 @@
 import discord
-from discord.ext import commands
 import requests
-from PIL import Image
-import easyocr
-import numpy as np
-import torch
-import re
-import io
 import os
+import json
+import re
+from datetime import datetime, timezone, timedelta
 
-import numpy as np
-
-print("NUMPY VERSION:", np.__version__)
-
-# =========================================================
-# SETTINGS
-# =========================================================
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GOOGLE_SCRIPT_URL = os.getenv("GOOGLE_SCRIPT_URL")
-SECRET_KEY = os.getenv("SECRET_KEY")
 
-
-if not DISCORD_TOKEN:
-    raise ValueError("DISCORD_TOKEN missing")
-
-if not GOOGLE_SCRIPT_URL:
-    raise ValueError("GOOGLE_SCRIPT_URL missing")
-
-if not SECRET_KEY:
-    raise ValueError("SECRET_KEY missing")
-
-
-# =========================================================
-# DISCORD SETTINGS
-# =========================================================
+IST = timezone(timedelta(hours=5, minutes=30))
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -42,1047 +21,402 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 
-# =========================================================
-# EASY OCR INITIALIZATION
-# =========================================================
+# ============================================================
+# HELPER - LOG
+# ============================================================
 
-print("Loading OCR Engine...")
-
-reader = easyocr.Reader(
-    ['en'],
-    gpu=False
-)
-
-print("OCR Engine Ready")
+def log(text):
+    print(f"[{datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')}] {text}")
 
 
-# =========================================================
-# NUMBER CLEAN FUNCTION
-# =========================================================
+# ============================================================
+# DOWNLOAD IMAGE
+# ============================================================
 
-def clean_amount(value):
-
-    if not value:
-        return None
-
-    value = str(value)
-
-    # Remove spaces
-    value = value.strip()
-
-    # OCR common mistakes
-    value = value.replace("O", "0")
-    value = value.replace("o", "0")
-
-    # Remove currency
-    value = value.replace("₹", "")
-    value = value.replace("INR", "")
-    value = value.replace("Rs.", "")
-    value = value.replace("Rs", "")
-
-    value = value.strip()
-
-    # Remove unwanted characters
-    value = re.sub(
-        r"[^0-9.,]",
-        "",
-        value
-    )
-
-    if not value:
-        return None
-
-
-    # Indian comma format
-    # Example: 1,921.00
+def download_image(url):
 
     try:
 
-        # If decimal present
-        if "." in value:
+        response = requests.get(url, timeout=30)
 
-            parts = value.split(".")
+        if response.status_code == 200:
+            return response.content
 
-            integer_part = parts[0].replace(",", "")
-            decimal_part = parts[-1]
-
-            if len(decimal_part) > 2:
-                decimal_part = decimal_part[:2]
-
-            number = float(
-                integer_part + "." + decimal_part
-            )
-
-        else:
-
-            number = float(
-                value.replace(",", "")
-            )
-
-
-        # Invalid small/huge numbers reject
-
-        if number <= 0:
-            return None
-
-        if number > 100000000:
-            return None
-
-
-        return round(number, 2)
-
-
-    except:
-
+        log(f"Image download failed: {response.status_code}")
         return None
-
-
-# =========================================================
-# FORMAT AMOUNT
-# =========================================================
-
-def format_amount(amount):
-
-    if amount is None:
-        return None
-
-    try:
-
-        return "{:,.2f}".format(
-            float(amount)
-        )
-
-    except:
-
-        return None
-
-
-# =========================================================
-# PREPROCESS IMAGE
-# =========================================================
-
-def preprocess_image(image):
-
-    # Convert RGB
-
-    if image.mode != "RGB":
-
-        image = image.convert("RGB")
-
-
-    # Enhance contrast
-
-    enhancer = ImageEnhance.Contrast(image)
-
-    image = enhancer.enhance(1.8)
-
-
-    # Enhance sharpness
-
-    enhancer = ImageEnhance.Sharpness(image)
-
-    image = enhancer.enhance(2)
-
-
-    return image
-
-
-# =========================================================
-# OCR IMAGE
-# =========================================================
-
-def run_ocr(image):
-
-    try:
-
-        image_np = np.array(image)
-
-
-        results = reader.readtext(
-            image_np,
-            detail=1,
-            paragraph=False
-        )
-
-
-        texts = []
-
-
-        for result in results:
-
-            bbox = result[0]
-
-            text = result[1]
-
-            confidence = result[2]
-
-
-            texts.append({
-
-                "text": text,
-
-                "confidence": confidence,
-
-                "bbox": bbox
-
-            })
-
-
-        return texts
-
 
     except Exception as e:
 
-        print("OCR ERROR:", e)
+        log(f"Image download error: {e}")
+        return None
 
-        return []
 
+# ============================================================
+# GEMINI AI OCR
+# ============================================================
 
-# =========================================================
-# EXTRACT AMOUNT FROM TEXT
-# =========================================================
-
-def find_amount_candidates(ocr_results):
-
-    candidates = []
-
-
-    for item in ocr_results:
-
-        text = item["text"]
-
-        confidence = item["confidence"]
-
-
-        print(
-            f"OCR: {text} | Confidence: {confidence:.2f}"
-        )
-
-
-        # -----------------------------------------
-        # Pattern 1
-        # ₹1,921.00
-        # ₹ 15,000
-        # -----------------------------------------
-
-        patterns = [
-
-            r'₹\s*([0-9OolI,]+(?:\.[0-9]{1,2})?)',
-
-            # Rs 1500
-
-            r'Rs\.?\s*([0-9OolI,]+(?:\.[0-9]{1,2})?)',
-
-            # INR 1500
-
-            r'INR\s*([0-9OolI,]+(?:\.[0-9]{1,2})?)',
-
-            # Amount 1500
-
-            r'(?:Amount|Paid|Payment|Total|Debited|Credited)'
-            r'[:\s]*₹?\s*'
-            r'([0-9OolI,]+(?:\.[0-9]{1,2})?)'
-        ]
-
-
-        for pattern in patterns:
-
-            matches = re.findall(
-                pattern,
-                text,
-                re.IGNORECASE
-            )
-
-
-            for match in matches:
-
-                amount = clean_amount(match)
-
-
-                if amount:
-
-                    candidates.append({
-
-                        "amount": amount,
-
-                        "confidence": confidence,
-
-                        "source": text,
-
-                        "priority": "currency"
-                    })
-
-
-        # -----------------------------------------
-        # Plain amount detection
-        # Example:
-        # 1,921.00
-        # 15,000
-        # -----------------------------------------
-
-        plain_matches = re.findall(
-
-            r'\b\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?\b',
-
-            text
-
-        )
-
-
-        for match in plain_matches:
-
-            amount = clean_amount(match)
-
-
-            if amount:
-
-                candidates.append({
-
-                    "amount": amount,
-
-                    "confidence": confidence * 0.8,
-
-                    "source": text,
-
-                    "priority": "plain"
-                })
-
-
-    return candidates
-
-
-# =========================================================
-# FILTER BAD NUMBERS
-# =========================================================
-
-def is_valid_payment_amount(amount):
-
-    if amount is None:
-        return False
-
-
-    # Very small random OCR values ignore
-
-    if amount < 1:
-        return False
-
-
-    # Unrealistically huge
-
-    if amount > 10000000:
-        return False
-
-
-    return True
-
-
-# =========================================================
-# IMAGE CROP OCR
-# =========================================================
-
-def create_crops(image):
-
-    width, height = image.size
-
-
-    crops = []
-
-
-    # Full Image
-
-    crops.append(
-        ("FULL", image)
-    )
-
-
-    # Top 50%
-
-    crops.append(
-
-        (
-            "TOP_HALF",
-
-            image.crop(
-                (
-                    0,
-                    0,
-                    width,
-                    int(height * 0.50)
-                )
-            )
-        )
-    )
-
-
-    # Top 65%
-
-    crops.append(
-
-        (
-            "TOP_65",
-
-            image.crop(
-                (
-                    0,
-                    0,
-                    width,
-                    int(height * 0.65)
-                )
-            )
-        )
-    )
-
-
-    # Top center
-
-    crops.append(
-
-        (
-            "TOP_CENTER",
-
-            image.crop(
-                (
-                    int(width * 0.10),
-                    int(height * 0.05),
-                    int(width * 0.90),
-                    int(height * 0.55)
-                )
-            )
-        )
-    )
-
-
-    # Center Area
-
-    crops.append(
-
-        (
-            "CENTER",
-
-            image.crop(
-                (
-                    int(width * 0.05),
-                    int(height * 0.15),
-                    int(width * 0.95),
-                    int(height * 0.70)
-                )
-            )
-        )
-    )
-
-
-    return crops
-
-
-# =========================================================
-# SMART AMOUNT SELECTOR
-# =========================================================
-
-def choose_best_amount(all_candidates):
-
-    if not all_candidates:
-
-        return None, 0
-
-
-    valid_candidates = []
-
-
-    for item in all_candidates:
-
-        amount = item["amount"]
-
-
-        if is_valid_payment_amount(amount):
-
-            valid_candidates.append(item)
-
-
-    if not valid_candidates:
-
-        return None, 0
-
-
-    # Group same amounts
-
-    amount_scores = {}
-
-
-    for item in valid_candidates:
-
-        amount = item["amount"]
-
-        score = item["confidence"]
-
-
-        # Currency amount gets priority
-
-        if item["priority"] == "currency":
-
-            score += 0.5
-
-
-        if amount not in amount_scores:
-
-            amount_scores[amount] = 0
-
-
-        amount_scores[amount] += score
-
-
-    # Sort
-
-    sorted_amounts = sorted(
-
-        amount_scores.items(),
-
-        key=lambda x: x[1],
-
-        reverse=True
-
-    )
-
-
-    best_amount = sorted_amounts[0][0]
-
-    best_score = sorted_amounts[0][1]
-
-
-    return best_amount, best_score
-
-
-# =========================================================
-# MAIN OCR FUNCTION
-# =========================================================
-
-def extract_amount(image_url):
+def read_payment_screenshot(image_bytes):
 
     try:
 
-        print("")
-        print("========================================")
-        print("DOWNLOADING SCREENSHOT")
-        print("========================================")
+        import base64
 
+        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
-        response = requests.get(
+        prompt = """
+You are a payment screenshot data extraction system.
 
-            image_url,
+Analyze the payment screenshot carefully.
 
-            timeout=30
+Extract ONLY these details:
 
+1. Amount paid
+2. Recipient / Party Name
+3. Payment Date if visible
+4. Payment Time if visible
+
+IMPORTANT RULES:
+
+- The amount must be the actual successful payment amount.
+- Ignore advertisements.
+- Ignore cashback.
+- Ignore account balance.
+- Ignore transaction IDs.
+- Ignore unrelated numbers.
+- Party name should be the person or business who received the payment.
+- If name is long, extract the complete visible recipient name.
+- Do not invent information.
+- If information is not visible return empty string.
+
+Return ONLY valid JSON.
+
+Format:
+
+{
+  "amount": "",
+  "party_name": "",
+  "payment_date": "",
+  "payment_time": "",
+  "confidence": ""
+}
+"""
+
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/"
+            "models/gemini-2.5-flash:generateContent"
+            f"?key={GEMINI_API_KEY}"
         )
 
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": prompt
+                        },
+                        {
+                            "inline_data": {
+                                "mime_type": "image/jpeg",
+                                "data": image_base64
+                            }
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0,
+                "responseMimeType": "application/json"
+            }
+        }
 
-        response.raise_for_status()
-
-
-        image = Image.open(
-
-            io.BytesIO(response.content)
-
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=60
         )
 
+        log(f"Gemini Status: {response.status_code}")
 
-        print(
-            f"Image Size: {image.size}"
-        )
+        if response.status_code != 200:
 
+            log(f"Gemini Error: {response.text}")
+            return None
 
-        # Preprocess
+        result = response.json()
 
-        image = preprocess_image(image)
+        text = result["candidates"][0]["content"]["parts"][0]["text"]
 
+        log(f"Gemini Raw Result: {text}")
 
-        # Create image crops
+        # Remove markdown if Gemini sends it
+        text = text.replace("```json", "")
+        text = text.replace("```", "")
+        text = text.strip()
 
-        crops = create_crops(image)
+        data = json.loads(text)
 
-
-        all_candidates = []
-
-
-        # ----------------------------------------
-        # OCR EVERY CROP
-        # ----------------------------------------
-
-        for crop_name, crop_image in crops:
-
-
-            print("")
-            print("========================================")
-
-            print(
-                f"RUNNING OCR: {crop_name}"
-            )
-
-            print("========================================")
-
-
-            results = run_ocr(
-                crop_image
-            )
-
-
-            candidates = find_amount_candidates(
-                results
-            )
-
-
-            for candidate in candidates:
-
-                candidate["crop"] = crop_name
-
-                all_candidates.append(
-                    candidate
-                )
-
-
-        # ----------------------------------------
-        # PRINT ALL FOUND AMOUNTS
-        # ----------------------------------------
-
-        print("")
-        print("========================================")
-
-        print("ALL AMOUNT CANDIDATES")
-
-        print("========================================")
-
-
-        for item in all_candidates:
-
-            print(
-
-                f"Amount: {item['amount']} | "
-                f"Confidence: {item['confidence']:.2f} | "
-                f"Crop: {item['crop']} | "
-                f"Text: {item['source']}"
-
-            )
-
-
-        # ----------------------------------------
-        # SELECT BEST AMOUNT
-        # ----------------------------------------
-
-        amount, score = choose_best_amount(
-
-            all_candidates
-
-        )
-
-
-        if amount:
-
-
-            final_amount = format_amount(
-                amount
-            )
-
-
-            print("")
-            print("========================================")
-
-            print(
-                f"FINAL AMOUNT: {final_amount}"
-            )
-
-            print(
-                f"FINAL SCORE: {score}"
-            )
-
-            print("========================================")
-
-
-            return final_amount
-
-
-        print("")
-        print("========================================")
-
-        print("FINAL RESULT: NOT FOUND")
-
-        print("========================================")
-
-
-        return "NOT FOUND"
-
+        return data
 
     except Exception as e:
 
-
-        print("")
-        print("========================================")
-
-        print("OCR FATAL ERROR")
-
-        print(e)
-
-        print("========================================")
+        log(f"Gemini Processing Error: {e}")
+        return None
 
 
-        return "NOT FOUND"
+# ============================================================
+# CLEAN AMOUNT
+# ============================================================
+
+def clean_amount(amount):
+
+    if not amount:
+        return ""
+
+    amount = str(amount)
+
+    amount = amount.replace("₹", "")
+    amount = amount.replace(",", "")
+    amount = amount.replace("Rs.", "")
+    amount = amount.replace("INR", "")
+    amount = amount.strip()
+
+    try:
+
+        value = float(amount)
+
+        return round(value, 2)
+
+    except:
+
+        return amount
 
 
-# =========================================================
-# GOOGLE SHEET ENTRY
-# =========================================================
+# ============================================================
+# SEND DATA TO GOOGLE SHEETS
+# ============================================================
 
 def send_to_google_sheet(
-
     party_name,
-
     amount,
-
     screenshot_url,
-
     discord_user,
-
-    message_id
-
+    message_id,
+    payment_date="",
+    payment_time=""
 ):
-
 
     try:
 
+        now = datetime.now(IST)
 
-        data = {
+        payload = {
 
+            "date_time": now.strftime("%d/%m/%Y %H:%M:%S"),
 
-            "secret": SECRET_KEY,
-
-
-            "partyName": party_name,
-
+            "party_name": party_name,
 
             "amount": amount,
 
+            "screenshot_url": screenshot_url,
 
-            "screenshot": screenshot_url,
+            "discord_user": discord_user,
 
+            "message_id": str(message_id),
 
-            "discordUser": discord_user,
+            "payment_date": payment_date,
 
-
-            "messageId": message_id
+            "payment_time": payment_time
 
         }
 
-
-        print("")
-        print("========================================")
-
-        print("SENDING TO GOOGLE SHEET")
-
-        print(data)
-
-        print("========================================")
-
+        log("Sending data to Google Sheet...")
 
         response = requests.post(
 
             GOOGLE_SCRIPT_URL,
 
-            json=data,
+            json=payload,
 
             timeout=30
 
         )
 
+        log(f"Google Script Response: {response.text}")
 
-        print("GOOGLE SHEET RESPONSE:")
-
-        print(response.status_code)
-
-        print(response.text)
-
+        return True
 
     except Exception as e:
 
+        log(f"Google Sheet Error: {e}")
 
-        print("GOOGLE SHEET ERROR:")
-
-        print(e)
+        return False
 
 
-# =========================================================
+# ============================================================
+# PROCESS MESSAGE
+# ============================================================
+
+async def process_payment_message(message):
+
+    if message.author.bot:
+        return
+
+    if not message.attachments:
+        return
+
+    log("=" * 60)
+    log("NEW PAYMENT MESSAGE RECEIVED")
+    log(f"Message ID: {message.id}")
+    log(f"Discord User: {message.author}")
+    log(f"Attachments: {len(message.attachments)}")
+
+    attachment = message.attachments[0]
+
+    # Check image
+    if not attachment.content_type:
+
+        filename = attachment.filename.lower()
+
+        if not filename.endswith(
+            (".jpg", ".jpeg", ".png", ".webp")
+        ):
+            log("Not an image")
+            return
+
+    log(f"Processing image: {attachment.filename}")
+
+    image_bytes = download_image(attachment.url)
+
+    if not image_bytes:
+
+        log("Image could not be downloaded")
+
+        return
+
+    # ========================================================
+    # AI OCR
+    # ========================================================
+
+    result = read_payment_screenshot(image_bytes)
+
+    if not result:
+
+        log("FINAL RESULT: NOT FOUND")
+
+        return
+
+    party_name = result.get("party_name", "")
+    amount = clean_amount(result.get("amount", ""))
+
+    payment_date = result.get("payment_date", "")
+    payment_time = result.get("payment_time", "")
+
+    confidence = result.get("confidence", "")
+
+    log("=" * 60)
+    log("AI RESULT")
+    log(f"Party Name: {party_name}")
+    log(f"Amount: {amount}")
+    log(f"Payment Date: {payment_date}")
+    log(f"Payment Time: {payment_time}")
+    log(f"Confidence: {confidence}")
+    log("=" * 60)
+
+    # ========================================================
+    # VALIDATION
+    # ========================================================
+
+    if not amount:
+
+        log("Amount not found")
+
+        return
+
+    if not party_name:
+
+        party_name = "UNKNOWN"
+
+    # ========================================================
+    # SEND TO GOOGLE SHEET
+    # ========================================================
+
+    success = send_to_google_sheet(
+
+        party_name=party_name,
+
+        amount=amount,
+
+        screenshot_url=attachment.url,
+
+        discord_user=str(message.author),
+
+        message_id=message.id,
+
+        payment_date=payment_date,
+
+        payment_time=payment_time
+
+    )
+
+    if success:
+
+        log("FINAL RESULT: SAVED SUCCESSFULLY")
+
+    else:
+
+        log("FINAL RESULT: GOOGLE SHEET ERROR")
+
+
+# ============================================================
 # BOT READY
-# =========================================================
+# ============================================================
 
 @client.event
 async def on_ready():
 
+    log("=" * 60)
+    log("🤖 DISCORD PAYMENT BOT ACTIVE")
+    log("=" * 60)
 
-    print("")
+    log(f"Bot Name: {client.user}")
+    log(f"Bot ID: {client.user.id}")
+    log(f"Servers: {len(client.guilds)}")
 
-    print("========================================")
-
-    print("🤖 DISCORD PAYMENT BOT ACTIVE")
-
-    print("========================================")
-
-    print(
-        f"Bot Name: {client.user}"
-    )
-
-    print(
-        f"Bot ID: {client.user.id}"
-    )
-
-    print(
-        f"Servers: {len(client.guilds)}"
-    )
-
-    print("========================================")
-
-    print("")
+    log("=" * 60)
 
 
-# =========================================================
-# BOT JOIN SERVER
-# =========================================================
-
-@client.event
-async def on_guild_join(guild):
-
-
-    print("")
-
-    print(
-        f"Joined Server: {guild.name}"
-    )
-
-
-# =========================================================
-# NEW DISCORD MESSAGE
-# =========================================================
+# ============================================================
+# NEW MESSAGE
+# ============================================================
 
 @client.event
 async def on_message(message):
 
+    try:
 
-    # -----------------------------------------
-    # Ignore Bot Messages
-    # -----------------------------------------
+        await process_payment_message(message)
 
-    if message.author.bot:
+    except Exception as e:
 
-        return
+        log(f"Message Processing Error: {e}")
 
 
-    # -----------------------------------------
-    # No attachment
-    # -----------------------------------------
-
-    if not message.attachments:
-
-        return
-
-
-    # -----------------------------------------
-    # Party Name
-    # -----------------------------------------
-
-    party_name = message.content.strip()
-
-
-    if not party_name:
-
-
-        print("")
-
-        print("========================================")
-
-        print("PARTY NAME MISSING")
-
-        print(
-            f"Message ID: {message.id}"
-        )
-
-        print("========================================")
-
-
-        return
-
-
-    # -----------------------------------------
-    # Message Info
-    # -----------------------------------------
-
-    print("")
-
-    print("========================================")
-
-    print("NEW PAYMENT MESSAGE")
-
-    print("========================================")
-
-    print(
-        f"Party Name: {party_name}"
-    )
-
-    print(
-        f"User: {message.author}"
-    )
-
-    print(
-        f"Message ID: {message.id}"
-    )
-
-    print(
-        f"Attachments: {len(message.attachments)}"
-    )
-
-    print("========================================")
-
-
-    # -----------------------------------------
-    # PROCESS ALL ATTACHMENTS
-    # -----------------------------------------
-
-    for attachment in message.attachments:
-
-
-        # Check image
-
-
-        is_image = False
-
-
-        if attachment.content_type:
-
-
-            if attachment.content_type.startswith("image"):
-
-                is_image = True
-
-
-        # If Discord content type missing
-
-
-        if not is_image:
-
-
-            filename = attachment.filename.lower()
-
-
-            if filename.endswith(
-
-                (
-                    ".png",
-                    ".jpg",
-                    ".jpeg",
-                    ".webp"
-                )
-
-            ):
-
-                is_image = True
-
-
-        if not is_image:
-
-            print(
-
-                f"Skipping non-image: "
-                f"{attachment.filename}"
-
-            )
-
-            continue
-
-
-        # -------------------------------------
-        # PROCESS IMAGE
-        # -------------------------------------
-
-        screenshot_url = attachment.url
-
-
-        print("")
-
-        print("========================================")
-
-        print(
-            f"PROCESSING IMAGE: {attachment.filename}"
-        )
-
-        print(
-            f"Screenshot URL: {screenshot_url}"
-        )
-
-        print("========================================")
-
-
-        # OCR in separate thread
-        # Bot freeze na thay
-
-
-        amount = await asyncio.to_thread(
-
-            extract_amount,
-
-            screenshot_url
-
-        )
-
-
-        # -------------------------------------
-        # SEND TO GOOGLE SHEET
-        # -------------------------------------
-
-        await asyncio.to_thread(
-
-            send_to_google_sheet,
-
-            party_name,
-
-            amount,
-
-            screenshot_url,
-
-            str(message.author),
-
-            str(message.id)
-
-        )
-
-
-        print("")
-
-        print("========================================")
-
-        print("PAYMENT PROCESS COMPLETED")
-
-        print(
-            f"Party: {party_name}"
-        )
-
-        print(
-            f"Amount: {amount}"
-        )
-
-        print(
-            f"Message ID: {message.id}"
-        )
-
-        print("========================================")
-
-
-# =========================================================
+# ============================================================
 # START BOT
-# =========================================================
+# ============================================================
 
 if __name__ == "__main__":
 
+    if not DISCORD_TOKEN:
 
-    print("")
+        raise ValueError("DISCORD_TOKEN not found")
 
-    print("========================================")
+    if not GEMINI_API_KEY:
 
-    print("STARTING DISCORD PAYMENT BOT")
+        raise ValueError("GEMINI_API_KEY not found")
 
-    print("========================================")
+    if not GOOGLE_SCRIPT_URL:
+
+        raise ValueError("GOOGLE_SCRIPT_URL not found")
 
     client.run(DISCORD_TOKEN)
