@@ -30,7 +30,7 @@ client = discord.Client(intents=intents)
 
 
 # ============================================================
-# LOG
+# LOG FUNCTION
 # ============================================================
 
 def log(message):
@@ -43,6 +43,30 @@ def log(message):
         f"[{now}] {message}",
         flush=True
     )
+
+
+# ============================================================
+# CLEAN PARTY NAME
+# PARTY NAME = DISCORD MESSAGE TEXT
+# ============================================================
+
+def clean_party_name(value):
+
+    try:
+
+        if not value:
+            return ""
+
+        value = str(value).strip()
+
+        # Multiple spaces / lines clean
+        value = " ".join(value.split())
+
+        return value
+
+    except Exception:
+
+        return ""
 
 
 # ============================================================
@@ -74,7 +98,6 @@ def download_image(url):
 
         return response.content
 
-
     except Exception as e:
 
         log(
@@ -86,6 +109,7 @@ def download_image(url):
 
 # ============================================================
 # GEMINI IMAGE ANALYSIS
+# ONLY AMOUNT + DATE + TIME
 # ============================================================
 
 def analyze_image(image_bytes, mime_type):
@@ -99,59 +123,46 @@ def analyze_image(image_bytes, mime_type):
         ).decode("utf-8")
 
 
-        # PARTY NAME GEMINI THI NATHI LEVANU
-        # ONLY AMOUNT, DATE AND TIME EXTRACT KARVANA
-
         prompt = """
-Analyze this payment screenshot carefully.
+Analyze this Indian payment screenshot carefully.
 
-Extract ONLY the following information:
+Extract ONLY the following:
 
 1. Actual successful payment amount
-2. Payment date visible in screenshot
-3. Payment time visible in screenshot
-
-
-IMPORTANT RULES:
-
-AMOUNT:
-
-- Extract ONLY the actual successful payment amount.
-- Ignore advertisements.
-- Ignore offers.
-- Ignore cashback.
-- Ignore account balance.
-- Ignore transaction ID.
-- Ignore reference numbers.
-- Ignore phone numbers.
-- Ignore random numbers.
-- Ignore wallet balance.
-- Ignore available balance.
-
-
-PAYMENT DATE:
-
-- Extract only the actual transaction/payment date.
-- Ignore screenshot upload date.
-- Ignore current date if unrelated to payment.
-
-
-PAYMENT TIME:
-
-- Extract only the actual transaction/payment time.
-- Ignore mobile status bar time if unrelated.
-- Ignore screenshot upload time.
-
-
-VERY IMPORTANT:
+2. Payment date
+3. Payment time
 
 DO NOT extract party name.
 
-Party name is provided separately from the Discord message text.
+IMPORTANT AMOUNT RULES:
+
+- Extract ONLY the actual successful payment amount.
+- Ignore account balance.
+- Ignore available balance.
+- Ignore wallet balance.
+- Ignore cashback.
+- Ignore offers.
+- Ignore transaction ID.
+- Ignore reference numbers.
+- Ignore phone numbers.
+- Ignore UPI IDs.
+- Ignore random numbers.
+- Ignore failed transaction amounts.
+- If multiple amounts exist, select the amount that was actually paid successfully.
+
+DATE RULES:
+
+- Extract the actual payment transaction date.
+- Ignore screenshot date if unrelated.
+
+TIME RULES:
+
+- Extract the actual payment transaction time.
+- Ignore mobile status bar time if possible.
 
 Return ONLY valid JSON.
 
-Return exactly this format:
+Format exactly:
 
 {
     "amount": "",
@@ -168,6 +179,8 @@ Example:
 }
 """
 
+
+        # GEMINI MODEL
 
         url = (
             "https://generativelanguage.googleapis.com/"
@@ -252,9 +265,6 @@ Example:
         result = response.json()
 
 
-        log("Gemini response received")
-
-
         try:
 
             text = (
@@ -263,7 +273,6 @@ Example:
                 ["parts"][0]
                 ["text"]
             )
-
 
         except Exception:
 
@@ -323,75 +332,19 @@ def clean_amount(value):
     try:
 
         if value is None:
-
             return ""
-
 
         value = str(value)
 
-
-        value = value.replace(
-            "₹",
-            ""
-        )
-
-        value = value.replace(
-            ",",
-            ""
-        )
-
-        value = value.replace(
-            "INR",
-            ""
-        )
-
-        value = value.replace(
-            "Rs.",
-            ""
-        )
-
-        value = value.replace(
-            "Rs",
-            ""
-        )
-
+        value = value.replace("₹", "")
+        value = value.replace(",", "")
+        value = value.replace("INR", "")
+        value = value.replace("Rs.", "")
+        value = value.replace("Rs", "")
 
         value = value.strip()
 
-
         return float(value)
-
-
-    except Exception:
-
-        return ""
-
-
-# ============================================================
-# CLEAN DISCORD PARTY NAME
-# ============================================================
-
-def clean_party_name(value):
-
-    try:
-
-        if not value:
-
-            return ""
-
-
-        value = str(value).strip()
-
-
-        # Multiple lines hoy to join kari de
-
-        value = " ".join(
-            value.split()
-        )
-
-
-        return value
-
 
     except Exception:
 
@@ -404,27 +357,25 @@ def clean_party_name(value):
 
 def send_to_sheet(
 
-    party_name,
-    amount,
-    screenshot_url,
-    discord_user,
-    message_id,
-    payment_date,
-    payment_time
+    action,
+    party_name="",
+    amount="",
+    screenshot_url="",
+    discord_user="",
+    message_id="",
+    payment_date="",
+    payment_time=""
 
 ):
 
     try:
 
-        log(
-            "Preparing Google Sheet data..."
-        )
-
-
         now = datetime.now(IST)
 
 
         payload = {
+
+            "action": action,
 
             "date_time": now.strftime(
                 "%d/%m/%Y %H:%M:%S"
@@ -448,7 +399,7 @@ def send_to_sheet(
 
 
         log(
-            "Sending data to Google Apps Script..."
+            f"Sending {action.upper()} request to Google Sheet..."
         )
 
 
@@ -462,8 +413,7 @@ def send_to_sheet(
 
             headers={
 
-                "Content-Type":
-                "application/json"
+                "Content-Type": "application/json"
 
             }
 
@@ -479,12 +429,7 @@ def send_to_sheet(
         )
 
 
-        if response.status_code == 200:
-
-            return True
-
-
-        return False
+        return response.status_code == 200
 
 
     except Exception as e:
@@ -497,10 +442,14 @@ def send_to_sheet(
 
 
 # ============================================================
-# PROCESS PAYMENT
+# PROCESS PAYMENT MESSAGE
+# CREATE OR UPDATE
 # ============================================================
 
-async def process_payment(message):
+async def process_payment(
+    message,
+    action="create"
+):
 
 
     log("")
@@ -510,7 +459,7 @@ async def process_payment(message):
     )
 
     log(
-        "NEW DISCORD MESSAGE RECEIVED"
+        f"PROCESSING PAYMENT - {action.upper()}"
     )
 
     log(
@@ -535,30 +484,19 @@ async def process_payment(message):
     )
 
 
-    # BOT MESSAGE IGNORE
+    # Ignore bot messages
 
     if message.author.bot:
 
         log(
-            "Ignored: Message is from bot"
-        )
-
-        return
-
-
-    # SCREENSHOT NATHI
-
-    if len(message.attachments) == 0:
-
-        log(
-            "Ignored: No attachment"
+            "Ignored: Bot message"
         )
 
         return
 
 
     # ========================================================
-    # PARTY NAME FROM DISCORD MESSAGE
+    # PARTY NAME FROM DISCORD TEXT
     # ========================================================
 
     party_name = clean_party_name(
@@ -566,46 +504,75 @@ async def process_payment(message):
     )
 
 
-    # PARTY NAME BLANK HOY TO STOP
-
     if not party_name:
 
         log(
-            "STOPPED: Party name not written in Discord message"
+            "Party Name missing in Discord message"
         )
 
+        # Update/create with blank name not allowed
         return
 
 
     log(
-        f"PARTY NAME FROM DISCORD: {party_name}"
+        f"PARTY NAME: {party_name}"
     )
 
 
     # ========================================================
-    # FIRST ATTACHMENT
+    # CHECK ATTACHMENT
+    # ========================================================
+
+    if len(message.attachments) == 0:
+
+        log(
+            "No screenshot attached"
+        )
+
+        # If edit only name and screenshot unchanged,
+        # we need to send update.
+        if action == "update":
+
+            success = send_to_sheet(
+
+                action="update",
+
+                party_name=party_name,
+
+                amount="",
+
+                screenshot_url="",
+
+                discord_user=str(message.author),
+
+                message_id=message.id,
+
+                payment_date="",
+
+                payment_time=""
+
+            )
+
+            if success:
+
+                log(
+                    "NAME UPDATE SENT SUCCESSFULLY"
+                )
+
+        return
+
+
+    # ========================================================
+    # PROCESS FIRST IMAGE
     # ========================================================
 
     attachment = message.attachments[0]
 
 
-    log(
-        f"Filename: {attachment.filename}"
-    )
-
-    log(
-        f"Content Type: {attachment.content_type}"
-    )
-
-    log(
-        f"URL: {attachment.url}"
-    )
-
-
     filename = attachment.filename.lower()
 
 
-    allowed = (
+    allowed_extensions = (
 
         ".jpg",
         ".jpeg",
@@ -615,13 +582,20 @@ async def process_payment(message):
     )
 
 
-    if not filename.endswith(allowed):
+    if not filename.endswith(
+        allowed_extensions
+    ):
 
         log(
-            "Ignored: Attachment is not image"
+            "Attachment is not image"
         )
 
         return
+
+
+    log(
+        f"Processing image: {attachment.filename}"
+    )
 
 
     # ========================================================
@@ -632,11 +606,9 @@ async def process_payment(message):
 
         mime_type = "image/png"
 
-
     elif filename.endswith(".webp"):
 
         mime_type = "image/webp"
-
 
     else:
 
@@ -644,7 +616,7 @@ async def process_payment(message):
 
 
     # ========================================================
-    # DOWNLOAD SCREENSHOT
+    # DOWNLOAD IMAGE
     # ========================================================
 
     image_bytes = download_image(
@@ -655,7 +627,7 @@ async def process_payment(message):
     if not image_bytes:
 
         log(
-            "STOPPED: Image download failed"
+            "Image download failed"
         )
 
         return
@@ -677,7 +649,7 @@ async def process_payment(message):
     if not result:
 
         log(
-            "STOPPED: Gemini did not return result"
+            "Gemini did not return result"
         )
 
         return
@@ -689,7 +661,6 @@ async def process_payment(message):
         "========== AI RESULT =========="
     )
 
-
     log(
         json.dumps(
             result,
@@ -697,31 +668,27 @@ async def process_payment(message):
         )
     )
 
-
     log(
         "==============================="
     )
 
 
     # ========================================================
-    # GET AMOUNT
+    # AMOUNT
     # ========================================================
 
     amount = clean_amount(
 
         result.get(
-
             "amount",
-
             ""
-
         )
 
     )
 
 
     # ========================================================
-    # GET PAYMENT DATE
+    # DATE
     # ========================================================
 
     payment_date = result.get(
@@ -734,7 +701,7 @@ async def process_payment(message):
 
 
     # ========================================================
-    # GET PAYMENT TIME
+    # TIME
     # ========================================================
 
     payment_time = result.get(
@@ -747,20 +714,20 @@ async def process_payment(message):
 
 
     # ========================================================
-    # CHECK AMOUNT
+    # VALIDATE AMOUNT
     # ========================================================
 
-    if not amount:
+    if amount == "":
 
         log(
-            "STOPPED: Amount not found"
+            "Amount not found - Entry not saved"
         )
 
         return
 
 
     # ========================================================
-    # FINAL DATA LOG
+    # FINAL DATA
     # ========================================================
 
     log("")
@@ -769,6 +736,9 @@ async def process_payment(message):
         "========== FINAL DATA =========="
     )
 
+    log(
+        f"Action: {action}"
+    )
 
     log(
         f"Party Name: {party_name}"
@@ -786,7 +756,6 @@ async def process_payment(message):
         f"Payment Time: {payment_time}"
     )
 
-
     log(
         "================================"
     )
@@ -798,56 +767,35 @@ async def process_payment(message):
 
     success = send_to_sheet(
 
-        party_name,
+        action=action,
 
-        amount,
+        party_name=party_name,
 
-        attachment.url,
+        amount=amount,
 
-        str(message.author),
+        screenshot_url=attachment.url,
 
-        message.id,
+        discord_user=str(message.author),
 
-        payment_date,
+        message_id=message.id,
 
-        payment_time
+        payment_date=payment_date,
+
+        payment_time=payment_time
 
     )
 
 
     if success:
 
-
-        log("")
-
         log(
-            "################################"
+            f"{action.upper()} SUCCESSFUL"
         )
-
-        log(
-            "FINAL RESULT: PAYMENT SAVED"
-        )
-
-        log(
-            "################################"
-        )
-
 
     else:
 
-
-        log("")
-
         log(
-            "################################"
-        )
-
-        log(
-            "FINAL RESULT: SHEET SAVE FAILED"
-        )
-
-        log(
-            "################################"
+            f"{action.upper()} FAILED"
         )
 
 
@@ -856,25 +804,21 @@ async def process_payment(message):
 # ============================================================
 
 @client.event
-
 async def on_ready():
-
 
     log("")
 
-
     log(
         "========================================"
     )
 
     log(
-        "🤖 DISCORD PAYMENT BOT ACTIVE"
+        "DISCORD PAYMENT BOT ACTIVE"
     )
 
     log(
         "========================================"
     )
-
 
     log(
         f"Bot Name: {client.user}"
@@ -888,42 +832,173 @@ async def on_ready():
         f"Servers: {len(client.guilds)}"
     )
 
-
     log(
         "========================================"
     )
 
 
 # ============================================================
-# MESSAGE EVENT
+# NEW MESSAGE
 # ============================================================
 
 @client.event
-
 async def on_message(message):
-
 
     try:
 
-        await process_payment(message)
+        await process_payment(
+
+            message,
+
+            action="create"
+
+        )
+
+    except Exception as e:
+
+        log(
+            f"NEW MESSAGE ERROR: {str(e)}"
+        )
+
+
+# ============================================================
+# MESSAGE EDIT
+# ============================================================
+
+@client.event
+async def on_message_edit(before, after):
+
+    try:
+
+        log("")
+
+        log(
+            "########################################"
+        )
+
+        log(
+            "DISCORD MESSAGE EDIT DETECTED"
+        )
+
+        log(
+            "########################################"
+        )
+
+
+        log(
+            f"Message ID: {after.id}"
+        )
+
+        log(
+            f"Old Name/Text: {before.content}"
+        )
+
+        log(
+            f"New Name/Text: {after.content}"
+        )
+
+
+        await process_payment(
+
+            after,
+
+            action="update"
+
+        )
 
 
     except Exception as e:
 
         log(
-            f"UNEXPECTED ERROR: {str(e)}"
+            f"MESSAGE EDIT ERROR: {str(e)}"
         )
 
 
 # ============================================================
-# START
+# MESSAGE DELETE
+# ============================================================
+
+@client.event
+async def on_message_delete(message):
+
+    try:
+
+        # Ignore bot messages
+
+        if message.author.bot:
+
+            return
+
+
+        log("")
+
+        log(
+            "########################################"
+        )
+
+        log(
+            "DISCORD MESSAGE DELETE DETECTED"
+        )
+
+        log(
+            "########################################"
+        )
+
+
+        log(
+            f"Message ID: {message.id}"
+        )
+
+
+        success = send_to_sheet(
+
+            action="delete",
+
+            message_id=message.id
+
+        )
+
+
+        if success:
+
+            log(
+                "SHEET ROW DELETE REQUEST SUCCESSFUL"
+            )
+
+        else:
+
+            log(
+                "SHEET ROW DELETE FAILED"
+            )
+
+
+    except Exception as e:
+
+        log(
+            f"MESSAGE DELETE ERROR: {str(e)}"
+        )
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+@client.event
+async def on_error(event, *args, **kwargs):
+
+    log(
+        f"DISCORD ERROR EVENT: {event}"
+    )
+
+
+# ============================================================
+# START BOT
 # ============================================================
 
 if __name__ == "__main__":
 
-
     log(
-        "Starting bot..."
+        "Starting Payment Bot..."
     )
 
 
