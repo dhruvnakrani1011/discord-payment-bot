@@ -58,75 +58,150 @@ def extract_amount(image_url):
 
         image = Image.open(
             io.BytesIO(response.content)
+        ).convert("RGB")
+
+
+        # Image size print
+        print(f"Image Size: {image.size}")
+
+
+        # =================================================
+        # OCR - DIFFERENT SETTINGS TRY KARO
+        # =================================================
+
+        text1 = pytesseract.image_to_string(
+            image,
+            config="--psm 6"
         )
 
 
-        # OCR
-        text = pytesseract.image_to_string(image)
+        text2 = pytesseract.image_to_string(
+            image,
+            config="--psm 11"
+        )
+
+
+        text = text1 + "\n" + text2
 
 
         print("\n========== OCR TEXT ==========")
+
         print(text)
+
         print("==============================\n")
 
 
-        # Amount patterns
+        # =================================================
+        # CLEAN TEXT
+        # =================================================
+
+        text = text.replace(",", "")
+
+        text = text.replace("₹", "₹ ")
+
+
+        # =================================================
+        # AMOUNT PATTERNS
+        # =================================================
+
         patterns = [
 
-            # ₹ 5,000
-            r'₹\s*([\d,]+(?:\.\d{1,2})?)',
+            # ₹ 5000
+            r'₹\s*([\d]+(?:\.\d{1,2})?)',
 
             # Rs 5000
-            r'Rs\.?\s*([\d,]+(?:\.\d{1,2})?)',
+            r'Rs\.?\s*([\d]+(?:\.\d{1,2})?)',
 
             # INR 5000
-            r'INR\s*([\d,]+(?:\.\d{1,2})?)',
+            r'INR\.?\s*([\d]+(?:\.\d{1,2})?)',
+
+            # ₹5,000.00 type
+            r'₹\s*([\d]+\.\d{2})',
+
+            # Paid ₹5000
+            r'Paid.*?₹?\s*([\d]+(?:\.\d{1,2})?)',
+
+            # Amount Paid 5000
+            r'Amount\s*Paid.*?₹?\s*([\d]+(?:\.\d{1,2})?)',
+
+            # Payment of 5000
+            r'Payment.*?₹?\s*([\d]+(?:\.\d{1,2})?)',
+
+            # Total Amount 5000
+            r'Total\s*Amount.*?₹?\s*([\d]+(?:\.\d{1,2})?)',
+
+            # Transaction Amount 5000
+            r'Transaction.*?₹?\s*([\d]+(?:\.\d{1,2})?)',
 
             # Amount: 5000
-            r'Amount[:\s]*₹?\s*([\d,]+(?:\.\d{1,2})?)',
-
-            # Paid: 5000
-            r'Paid[:\s]*₹?\s*([\d,]+(?:\.\d{1,2})?)',
+            r'Amount\s*[:\-]?\s*₹?\s*([\d]+(?:\.\d{1,2})?)',
 
             # Total: 5000
-            r'Total[:\s]*₹?\s*([\d,]+(?:\.\d{1,2})?)',
+            r'Total\s*[:\-]?\s*₹?\s*([\d]+(?:\.\d{1,2})?)',
 
-            # Payment: 5000
-            r'Payment[:\s]*₹?\s*([\d,]+(?:\.\d{1,2})?)'
+            # Debited 5000
+            r'Debited.*?₹?\s*([\d]+(?:\.\d{1,2})?)',
+
+            # Sent 5000
+            r'Sent.*?₹?\s*([\d]+(?:\.\d{1,2})?)',
+
+            # Received 5000
+            r'Received.*?₹?\s*([\d]+(?:\.\d{1,2})?)'
 
         ]
 
 
+        # =================================================
+        # FIND AMOUNT
+        # =================================================
+
         for pattern in patterns:
 
-            match = re.search(
+            matches = re.findall(
                 pattern,
                 text,
-                re.IGNORECASE
+                re.IGNORECASE | re.DOTALL
             )
 
 
-            if match:
+            if matches:
 
-                amount = match.group(1)
+                for amount in matches:
 
-                amount = amount.replace(",", "")
+                    amount = str(amount)
 
-                print(f"Amount Found: {amount}")
+                    amount = amount.replace(",", "")
 
-                return amount
+                    try:
+
+                        number = float(amount)
 
 
-        print("Amount not found")
+                        # Minimum payment amount
+                        if number >= 1:
 
-        return ""
+                            print(
+                                f"Amount Found: {amount}"
+                            )
+
+                            return amount
+
+
+                    except:
+
+                        continue
+
+
+        print("❌ Amount not found")
+
+        return "NOT FOUND"
 
 
     except Exception as e:
 
         print(f"OCR ERROR: {e}")
 
-        return ""
+        return "NOT FOUND"
 
 
 # =========================================================
