@@ -1,4 +1,7 @@
 discord.py
 requests
-pytesseract
 Pillow
+easyocr
+numpy
+torch
+torchvision
