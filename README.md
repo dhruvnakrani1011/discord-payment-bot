@@ -1,4 +1,2 @@
-discord.py
-requests
-Pillow
-easyocr
+discord.py==2.4.0
+requests==2.32.3
