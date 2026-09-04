@@ -1,40 +1,132 @@
-import discord
-import requests
-import re
-import io
 import os
-from PIL import Image
-import pytesseract
+import asyncio
+import discord
+from discord.ext import commands
+from dotenv import load_dotenv
 
-# ==============================
-# SETTINGS
-# ==============================
+# Load environment variables
+load_dotenv()
 
-DISCORD_TOKEN = "YOUR_DISCORD_BOT_TOKEN"
+# Get Discord token
+TOKEN = os.getenv("DISCORD_TOKEN")
 
-GOOGLE_SCRIPT_URL = "YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL"
+# Check token before starting
+if not TOKEN:
+    raise ValueError("DISCORD_TOKEN is missing! Please add it in Railway Variables.")
 
-SECRET_KEY = "CHANGE_THIS_TO_YOUR_SECRET_KEY"
+# Remove accidental spaces
+TOKEN = TOKEN.strip()
 
-
-# ==============================
-# DISCORD SETTINGS
-# ==============================
-
+# Discord Intents
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
-client = discord.Client(intents=intents)
+# Create Bot
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents
+)
 
 
 # ==============================
-# AMOUNT DETECTION
+# BOT READY
 # ==============================
 
-def extract_amount(image_url):
+@bot.event
+async def on_ready():
+
+    print("=================================")
+    print(f"Bot Logged In Successfully!")
+    print(f"Bot Name: {bot.user}")
+    print(f"Bot ID: {bot.user.id}")
+    print("=================================")
 
     try:
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=discord.Game(name="Payment Verification Bot")
+        )
+    except Exception as e:
+        print(f"Presence Error: {e}")
 
+
+# ==============================
+# ERROR HANDLER
+# ==============================
+
+@bot.event
+async def on_command_error(ctx, error):
+
+    if isinstance(error, commands.CommandNotFound):
+        return
+
+    print(f"Command Error: {error}")
+
+    try:
+        await ctx.send(f"❌ Error: {error}")
+    except:
+        pass
+
+
+# ==============================
+# TEST COMMAND
+# ==============================
+
+@bot.command()
+async def ping(ctx):
+
+    await ctx.send("🏓 Pong! Bot is working properly.")
+
+
+# ==============================
+# BOT STATUS COMMAND
+# ==============================
+
+@bot.command()
+async def status(ctx):
+
+    embed = discord.Embed(
+        title="🤖 Bot Status",
+        description="Bot is currently online and working!",
+    )
+
+    embed.add_field(
+        name="Bot Name",
+        value=str(bot.user),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Latency",
+        value=f"{round(bot.latency * 1000)} ms",
+        inline=False
+    )
+
+    await ctx.send(embed=embed)
+
+
+# ==============================
+# START BOT
+# ==============================
+
+async def main():
+
+    async with bot:
+        await bot.start(TOKEN)
+
+
+if __name__ == "__main__":
+
+    try:
+        asyncio.run(main())
+
+    except discord.LoginFailure:
+        print("ERROR: Invalid Discord Token!")
+        print("Please check DISCORD_TOKEN in Railway Variables.")
+
+    except Exception as e:
+        print(f"Fatal Error: {e}")
         response = requests.get(image_url, timeout=30)
 
         image = Image.open(io.BytesIO(response.content))
