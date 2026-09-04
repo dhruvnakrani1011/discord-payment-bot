@@ -10,6 +10,9 @@ import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
 import easyocr
 
+import numpy as np
+
+print("NUMPY VERSION:", np.__version__)
 
 # =========================================================
 # SETTINGS
