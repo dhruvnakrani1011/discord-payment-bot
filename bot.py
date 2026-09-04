@@ -6,7 +6,7 @@ import discord
 import requests
 import pytesseract
 
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 
 # =========================================================
@@ -16,6 +16,7 @@ from PIL import Image, ImageEnhance, ImageFilter
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GOOGLE_SCRIPT_URL = os.getenv("GOOGLE_SCRIPT_URL")
 SECRET_KEY = os.getenv("SECRET_KEY")
+
 
 if not DISCORD_TOKEN:
     raise ValueError("DISCORD_TOKEN missing")
@@ -47,16 +48,21 @@ STRONG_KEYWORDS = [
     "paid",
     "payment",
     "you paid",
-    "successfully paid",
+    "you sent",
     "sent",
+    "successfully paid",
+    "payment successful",
+    "payment successful!",
+    "paid successfully",
     "transfer amount",
+    "transaction amount",
     "debited",
     "credited",
-    "total amount",
-    "transaction amount",
-    "paid successfully",
-    "payment successful",
-    "money sent"
+    "money sent",
+    "money transferred",
+    "payment done",
+    "transfer successful",
+    "successfully sent"
 
 ]
 
@@ -66,9 +72,12 @@ MEDIUM_KEYWORDS = [
     "upi",
     "transfer",
     "success",
-    "completed",
     "successful",
-    "transaction"
+    "completed",
+    "transaction",
+    "expense",
+    "paid to",
+    "sent to"
 
 ]
 
@@ -84,15 +93,18 @@ BAD_KEYWORDS = [
     "utr",
     "reference",
     "upi ref",
+    "upi reference",
     "account number",
     "account no",
     "mobile",
     "phone",
     "contact",
-    "date",
-    "time",
     "ifsc",
-    "rrn"
+    "rrn",
+    "balance",
+    "available balance",
+    "kotak txn id",
+    "transaction number"
 
 ]
 
@@ -112,6 +124,7 @@ def clean_amount(value):
     value = value.replace("Rs.", "")
     value = value.replace("Rs", "")
     value = value.replace("INR", "")
+    value = value.replace("inr", "")
 
     value = value.replace(",", "")
     value = value.replace(" ", "")
@@ -120,13 +133,8 @@ def clean_amount(value):
     value = value.replace("–", "")
     value = value.replace("—", "")
 
-    value = re.sub(
-        r"[^\d.]",
-        "",
-        value
-    )
+    value = re.sub(r"[^\d.]", "", value)
 
-    # Multiple decimal avoid
     if value.count(".") > 1:
 
         parts = value.split(".")
@@ -137,20 +145,19 @@ def clean_amount(value):
 
 
 # =========================================================
-# VALIDATE POSSIBLE AMOUNT
+# VALID AMOUNT CHECK
 # =========================================================
 
 def is_valid_amount(value):
 
     try:
 
-        value = float(value)
+        number = float(value)
 
-        # Payment amount limits
-        if value < 1:
+        if number < 1:
             return False
 
-        if value > 100000000:
+        if number > 10000000:
             return False
 
         return True
@@ -161,28 +168,30 @@ def is_valid_amount(value):
 
 
 # =========================================================
-# IGNORE INVALID NUMBERS
+# SUSPICIOUS NUMBER CHECK
 # =========================================================
 
 def is_suspicious_number(number):
 
-    digits = re.sub(
-        r"\D",
-        "",
-        number
-    )
+    digits = re.sub(r"\D", "", str(number))
+
+    if not digits:
+        return True
+
 
     # Mobile number
     if len(digits) == 10:
 
         return True
 
-    # Transaction IDs / Account numbers
+
+    # Long transaction / reference numbers
     if len(digits) >= 11:
 
         return True
 
-    # Year
+
+    # Years
     if digits in [
 
         "2023",
@@ -190,20 +199,314 @@ def is_suspicious_number(number):
         "2025",
         "2026",
         "2027",
-        "2028"
+        "2028",
+        "2029",
+        "2030"
 
     ]:
 
         return True
 
+
+    # Very common time values
+    if len(digits) == 4:
+
+        try:
+
+            num = int(digits)
+
+            # HHMM possible time
+            hour = num // 100
+            minute = num % 100
+
+            if hour <= 23 and minute <= 59:
+
+                return True
+
+        except:
+
+            pass
+
+
     return False
 
 
 # =========================================================
-# EXTRACT CANDIDATE AMOUNTS
+# DATE CHECK
 # =========================================================
 
-def extract_candidates(text):
+def is_date_line(line):
+
+    patterns = [
+
+        r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b',
+
+        r'\b\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)',
+
+        r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b'
+
+    ]
+
+
+    for pattern in patterns:
+
+        if re.search(pattern, line.lower()):
+
+            return True
+
+
+    return False
+
+
+# =========================================================
+# EXTRACT NUMBER CANDIDATES
+# =========================================================
+
+def find_numbers_in_line(line):
+
+    results = []
+
+
+    # Currency amount patterns
+    currency_patterns = [
+
+        r'[-–—]?\s*₹\s*[\d,]+(?:\.\d{1,2})?',
+
+        r'[-–—]?\s*(?:rs\.?|inr)\s*[\d,]+(?:\.\d{1,2})?',
+
+        r'₹\s*[\d,]+(?:\.\d{1,2})?',
+
+        r'(?:rs\.?|inr)\s*[\d,]+(?:\.\d{1,2})?'
+
+    ]
+
+
+    for pattern in currency_patterns:
+
+        matches = re.findall(
+
+            pattern,
+
+            line,
+
+            re.IGNORECASE
+
+        )
+
+
+        for match in matches:
+
+            results.append({
+
+                "raw": match,
+
+                "currency": True
+
+            })
+
+
+    # Normal numbers
+    normal_pattern = r'(?<![\d/])\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?(?![\d/])'
+
+    matches = re.findall(normal_pattern, line)
+
+
+    for match in matches:
+
+        results.append({
+
+            "raw": match,
+
+            "currency": False
+
+        })
+
+
+    # Plain number only if short enough
+    plain_pattern = r'(?<![\d/])\d+(?:\.\d{1,2})?(?![\d/])'
+
+    matches = re.findall(plain_pattern, line)
+
+
+    for match in matches:
+
+        # Avoid duplicates
+        already = False
+
+        for item in results:
+
+            if clean_amount(item["raw"]) == clean_amount(match):
+
+                already = True
+
+                break
+
+
+        if not already:
+
+            results.append({
+
+                "raw": match,
+
+                "currency": False
+
+            })
+
+
+    return results
+
+
+# =========================================================
+# SCORE CANDIDATE
+# =========================================================
+
+def calculate_score(
+
+    raw_number,
+    line,
+    previous_line,
+    next_line,
+    line_index,
+    is_top_area
+
+):
+
+    score = 0
+
+    line_lower = line.lower()
+
+    previous_lower = previous_line.lower()
+
+    next_lower = next_line.lower()
+
+
+    # =====================================================
+    # CURRENCY BONUS
+    # =====================================================
+
+    if "₹" in raw_number:
+
+        score += 500
+
+
+    if "rs" in raw_number.lower():
+
+        score += 400
+
+
+    if "inr" in raw_number.lower():
+
+        score += 400
+
+
+    # =====================================================
+    # STRONG KEYWORD SAME LINE
+    # =====================================================
+
+    for keyword in STRONG_KEYWORDS:
+
+        if keyword in line_lower:
+
+            score += 200
+
+
+    # =====================================================
+    # MEDIUM KEYWORD SAME LINE
+    # =====================================================
+
+    for keyword in MEDIUM_KEYWORDS:
+
+        if keyword in line_lower:
+
+            score += 50
+
+
+    # =====================================================
+    # PREVIOUS LINE
+    # =====================================================
+
+    for keyword in STRONG_KEYWORDS:
+
+        if keyword in previous_lower:
+
+            score += 100
+
+
+    for keyword in MEDIUM_KEYWORDS:
+
+        if keyword in previous_lower:
+
+            score += 25
+
+
+    # =====================================================
+    # NEXT LINE
+    # =====================================================
+
+    for keyword in STRONG_KEYWORDS:
+
+        if keyword in next_lower:
+
+            score += 100
+
+
+    for keyword in MEDIUM_KEYWORDS:
+
+        if keyword in next_lower:
+
+            score += 25
+
+
+    # =====================================================
+    # BAD KEYWORDS
+    # =====================================================
+
+    for keyword in BAD_KEYWORDS:
+
+        if keyword in line_lower:
+
+            score -= 500
+
+
+    for keyword in BAD_KEYWORDS:
+
+        if keyword in previous_lower:
+
+            score -= 200
+
+
+    # =====================================================
+    # DATE PENALTY
+    # =====================================================
+
+    if is_date_line(line):
+
+        score -= 300
+
+
+    # =====================================================
+    # TOP AREA BONUS
+    # =====================================================
+
+    if is_top_area:
+
+        score += 100
+
+
+    # First few OCR lines generally payment summary
+    if line_index <= 6:
+
+        score += 30
+
+
+    return score
+
+
+# =========================================================
+# EXTRACT CANDIDATES
+# =========================================================
+
+def extract_candidates(text, is_top_area=False):
 
     candidates = []
 
@@ -212,42 +515,36 @@ def extract_candidates(text):
 
     for index, line in enumerate(lines):
 
-        original_line = line
-
-        line_lower = line.lower()
+        line = line.strip()
 
 
-        # Find numbers with comma
-        numbers = re.findall(
+        if not line:
 
-            r'(?<!\d)(?:₹|rs\.?|inr)?\s*[-–—]?\s*\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?',
-
-            original_line,
-
-            re.IGNORECASE
-
-        )
+            continue
 
 
-        # Find normal numbers
-        numbers += re.findall(
+        previous_line = ""
 
-            r'(?<![\d/])(?:₹|rs\.?|inr)?\s*[-–—]?\s*\d+(?:\.\d{1,2})?(?![\d/])',
-
-            original_line,
-
-            re.IGNORECASE
-
-        )
+        next_line = ""
 
 
-        for raw_number in numbers:
+        if index > 0:
+
+            previous_line = lines[index - 1]
 
 
-            # Remove duplicates / empty
-            if not raw_number.strip():
+        if index < len(lines) - 1:
 
-                continue
+            next_line = lines[index + 1]
+
+
+        numbers = find_numbers_in_line(line)
+
+
+        for item in numbers:
+
+
+            raw_number = item["raw"]
 
 
             amount = clean_amount(raw_number)
@@ -268,107 +565,35 @@ def extract_candidates(text):
                 continue
 
 
-            score = 0
+            # If line looks like date and no currency symbol,
+            # reject it completely
+
+            if is_date_line(line) and not item["currency"]:
+
+                continue
 
 
-            # =============================================
-            # CURRENCY SYMBOL BONUS
-            # =============================================
+            score = calculate_score(
 
-            if "₹" in raw_number:
+                raw_number=raw_number,
 
-                score += 80
+                line=line,
 
+                previous_line=previous_line,
 
-            if "rs" in raw_number.lower():
+                next_line=next_line,
 
-                score += 60
+                line_index=index,
 
+                is_top_area=is_top_area
 
-            if "inr" in raw_number.lower():
-
-                score += 60
+            )
 
 
-            # =============================================
-            # STRONG KEYWORDS
-            # =============================================
+            # Currency explicitly found
+            if item["currency"]:
 
-            for keyword in STRONG_KEYWORDS:
-
-                if keyword in line_lower:
-
-                    score += 100
-
-
-            # =============================================
-            # MEDIUM KEYWORDS
-            # =============================================
-
-            for keyword in MEDIUM_KEYWORDS:
-
-                if keyword in line_lower:
-
-                    score += 25
-
-
-            # =============================================
-            # BAD KEYWORDS
-            # =============================================
-
-            for keyword in BAD_KEYWORDS:
-
-                if keyword in line_lower:
-
-                    score -= 150
-
-
-            # =============================================
-            # CHECK PREVIOUS LINE
-            # =============================================
-
-            if index > 0:
-
-                previous = lines[index - 1].lower()
-
-
-                for keyword in STRONG_KEYWORDS:
-
-                    if keyword in previous:
-
-                        score += 50
-
-
-                for keyword in BAD_KEYWORDS:
-
-                    if keyword in previous:
-
-                        score -= 100
-
-
-            # =============================================
-            # CHECK NEXT LINE
-            # =============================================
-
-            if index < len(lines) - 1:
-
-                next_line = lines[index + 1].lower()
-
-
-                for keyword in STRONG_KEYWORDS:
-
-                    if keyword in next_line:
-
-                        score += 50
-
-
-            # =============================================
-            # PAYMENT SCREENSHOT TOP AREA BONUS
-            # =============================================
-
-            if index <= 5:
-
-                score += 20
+                score += 300
 
 
             candidate = {
@@ -377,9 +602,11 @@ def extract_candidates(text):
 
                 "score": score,
 
-                "line": original_line.strip(),
+                "line": line,
 
-                "raw": raw_number.strip()
+                "raw": raw_number,
+
+                "currency": item["currency"]
 
             }
 
@@ -388,6 +615,37 @@ def extract_candidates(text):
 
 
     return candidates
+
+
+# =========================================================
+# REMOVE DUPLICATE CANDIDATES
+# =========================================================
+
+def remove_duplicate_candidates(candidates):
+
+    best_candidates = {}
+
+
+    for candidate in candidates:
+
+
+        amount = candidate["amount"]
+
+
+        if amount not in best_candidates:
+
+            best_candidates[amount] = candidate
+
+
+        else:
+
+
+            if candidate["score"] > best_candidates[amount]["score"]:
+
+                best_candidates[amount] = candidate
+
+
+    return list(best_candidates.values())
 
 
 # =========================================================
@@ -401,7 +659,8 @@ def select_best_amount(candidates):
         return "", 0
 
 
-    # Sort highest score first
+    candidates = remove_duplicate_candidates(candidates)
+
 
     candidates = sorted(
 
@@ -414,7 +673,8 @@ def select_best_amount(candidates):
     )
 
 
-    print("\n========== AMOUNT CANDIDATES ==========")
+    print("\n========== ALL AMOUNT CANDIDATES ==========")
+
 
     for candidate in candidates:
 
@@ -424,99 +684,308 @@ def select_best_amount(candidates):
 
             f"Score: {candidate['score']} | "
 
+            f"Currency: {candidate['currency']} | "
+
             f"Line: {candidate['line']}"
 
         )
 
 
-    print("========================================\n")
+    print("============================================\n")
 
 
     best = candidates[0]
+
+
+    # Very low confidence reject
+
+    if best["score"] < 50:
+
+        return "NOT FOUND", 0
 
 
     return best["amount"], best["score"]
 
 
 # =========================================================
-# OCR ONE IMAGE
-# =========================================================
-
-def perform_ocr(image, mode):
-
-    try:
-
-        text = pytesseract.image_to_string(
-
-            image,
-
-            config=f"--psm {mode}"
-
-        )
-
-        return text
-
-    except Exception as e:
-
-        print(f"OCR Error Mode {mode}: {e}")
-
-        return ""
-
-
-# =========================================================
-# IMAGE PREPROCESSING
+# PREPROCESS IMAGE
 # =========================================================
 
 def preprocess_image(image):
 
 
-    # Convert RGB
     image = image.convert("RGB")
 
 
-    # Resize for better OCR
     width, height = image.size
 
 
-    if width < 2000:
+    # Resize small screenshots
+
+    if width < 1800:
+
+
+        scale = 2
+
 
         image = image.resize(
 
             (
 
-                width * 2,
+                width * scale,
 
-                height * 2
+                height * scale
 
             )
 
         )
 
 
-    # Convert grayscale
-
-    image = image.convert("L")
+    image = ImageOps.grayscale(image)
 
 
-    # Contrast
-
-    image = ImageEnhance.Contrast(
-
-        image
-
-    ).enhance(2)
+    image = ImageEnhance.Contrast(image).enhance(2.5)
 
 
-    # Sharpness
+    image = ImageEnhance.Sharpness(image).enhance(2)
 
-    image = ImageEnhance.Sharpness(
 
-        image
+    image = image.filter(
 
-    ).enhance(2)
+        ImageFilter.SHARPEN
+
+    )
 
 
     return image
+
+
+# =========================================================
+# OCR FUNCTION
+# =========================================================
+
+def perform_ocr(image, mode):
+
+    try:
+
+
+        text = pytesseract.image_to_string(
+
+            image,
+
+            config=f"--oem 3 --psm {mode}"
+
+        )
+
+
+        return text
+
+
+    except Exception as e:
+
+
+        print(
+
+            f"OCR Error Mode {mode}: {e}"
+
+        )
+
+
+        return ""
+
+
+# =========================================================
+# OCR IMAGE WITH MULTIPLE METHODS
+# =========================================================
+
+def extract_amount_from_image(image):
+
+
+    processed = preprocess_image(image)
+
+
+    all_candidates = []
+
+
+    # =====================================================
+    # FULL IMAGE OCR MODE 6
+    # =====================================================
+
+    print("\nRunning OCR Mode 6...")
+
+
+    text_6 = perform_ocr(
+
+        processed,
+
+        6
+
+    )
+
+
+    print("\n========== OCR MODE 6 ==========")
+
+    print(text_6)
+
+    print("================================")
+
+
+    all_candidates.extend(
+
+        extract_candidates(
+
+            text_6,
+
+            False
+
+        )
+
+    )
+
+
+    # =====================================================
+    # FULL IMAGE OCR MODE 11
+    # =====================================================
+
+    print("\nRunning OCR Mode 11...")
+
+
+    text_11 = perform_ocr(
+
+        processed,
+
+        11
+
+    )
+
+
+    print("\n========== OCR MODE 11 ==========")
+
+    print(text_11)
+
+    print("=================================")
+
+
+    all_candidates.extend(
+
+        extract_candidates(
+
+            text_11,
+
+            False
+
+        )
+
+    )
+
+
+    width, height = processed.size
+
+
+    # =====================================================
+    # TOP 50% OCR
+    # =====================================================
+
+    top_image = processed.crop(
+
+        (
+
+            0,
+
+            0,
+
+            width,
+
+            int(height * 0.50)
+
+        )
+
+    )
+
+
+    print("\nRunning TOP AREA OCR...")
+
+
+    top_text = perform_ocr(
+
+        top_image,
+
+        6
+
+    )
+
+
+    print("\n========== TOP OCR ==========")
+
+    print(top_text)
+
+    print("=============================")
+
+
+    all_candidates.extend(
+
+        extract_candidates(
+
+            top_text,
+
+            True
+
+        )
+
+    )
+
+
+    # =====================================================
+    # TOP 35% OCR MODE 11
+    # =====================================================
+
+    top_small = processed.crop(
+
+        (
+
+            0,
+
+            0,
+
+            width,
+
+            int(height * 0.35)
+
+        )
+
+    )
+
+
+    print("\nRunning TOP SMALL OCR...")
+
+
+    top_small_text = perform_ocr(
+
+        top_small,
+
+        11
+
+    )
+
+
+    all_candidates.extend(
+
+        extract_candidates(
+
+            top_small_text,
+
+            True
+
+        )
+
+    )
+
+
+    return select_best_amount(
+
+        all_candidates
+
+    )
 
 
 # =========================================================
@@ -528,7 +997,9 @@ def extract_amount(image_url):
     try:
 
 
-        print("\n========================================")
+        print("\n")
+
+        print("========================================")
 
         print("DOWNLOADING PAYMENT SCREENSHOT")
 
@@ -554,136 +1025,16 @@ def extract_amount(image_url):
         )
 
 
-        print(f"Image Size: {image.size}")
+        print(
 
-
-        processed_image = preprocess_image(image)
-
-
-        all_candidates = []
-
-
-        # =================================================
-        # OCR MODE 6
-        # =================================================
-
-        print("\nRunning OCR Mode 6...")
-
-
-        text_6 = perform_ocr(
-
-            processed_image,
-
-            6
+            f"Image Size: {image.size}"
 
         )
 
 
-        print("\n========== OCR MODE 6 ==========")
+        amount, score = extract_amount_from_image(
 
-        print(text_6)
-
-        print("================================")
-
-
-        candidates = extract_candidates(text_6)
-
-        all_candidates.extend(candidates)
-
-
-        # =================================================
-        # OCR MODE 11
-        # =================================================
-
-        print("\nRunning OCR Mode 11...")
-
-
-        text_11 = perform_ocr(
-
-            processed_image,
-
-            11
-
-        )
-
-
-        print("\n========== OCR MODE 11 ==========")
-
-        print(text_11)
-
-        print("=================================")
-
-
-        candidates = extract_candidates(text_11)
-
-        all_candidates.extend(candidates)
-
-
-        # =================================================
-        # OCR TOP SECTION
-        # =================================================
-
-        width, height = processed_image.size
-
-
-        # Top 40% generally payment amount hoy
-
-        top_image = processed_image.crop(
-
-            (
-
-                0,
-
-                0,
-
-                width,
-
-                int(height * 0.40)
-
-            )
-
-        )
-
-
-        print("\nRunning TOP AREA OCR...")
-
-
-        top_text = perform_ocr(
-
-            top_image,
-
-            6
-
-        )
-
-
-        print("\n========== TOP OCR ==========")
-
-        print(top_text)
-
-        print("=============================")
-
-
-        candidates = extract_candidates(top_text)
-
-
-        # Top area candidates extra priority
-
-        for candidate in candidates:
-
-            candidate["score"] += 40
-
-
-        all_candidates.extend(candidates)
-
-
-        # =================================================
-        # SELECT BEST RESULT
-        # =================================================
-
-        amount, score = select_best_amount(
-
-            all_candidates
+            image
 
         )
 
@@ -695,7 +1046,9 @@ def extract_amount(image_url):
             return "NOT FOUND", 0
 
 
-        print("\n========================================")
+        print("\n")
+
+        print("========================================")
 
         print(f"FINAL AMOUNT: {amount}")
 
@@ -710,7 +1063,9 @@ def extract_amount(image_url):
     except Exception as e:
 
 
-        print("\n========================================")
+        print("\n")
+
+        print("========================================")
 
         print("UNIVERSAL OCR ERROR")
 
@@ -729,17 +1084,17 @@ def extract_amount(image_url):
 def get_status(score):
 
 
-    if score >= 150:
+    if score >= 700:
 
         return "VERIFIED"
 
 
-    elif score >= 80:
+    elif score >= 400:
 
         return "LIKELY"
 
 
-    elif score > 0:
+    elif score >= 100:
 
         return "CHECK"
 
@@ -889,7 +1244,7 @@ async def on_message(message):
         return
 
 
-    # Screenshot check
+    # Ignore message without attachment
 
     if not message.attachments:
 
@@ -904,11 +1259,7 @@ async def on_message(message):
     if not party_name:
 
 
-        print(
-
-            "❌ PARTY NAME MISSING"
-
-        )
+        print("❌ PARTY NAME MISSING")
 
 
         return
@@ -928,16 +1279,12 @@ async def on_message(message):
 
     print(f"Message ID: {message.id}")
 
-    print(
-
-        f"Attachments: {len(message.attachments)}"
-
-    )
+    print(f"Attachments: {len(message.attachments)}")
 
     print("========================================")
 
 
-    # Process every attachment
+    # Process attachments
 
     for attachment in message.attachments:
 
@@ -951,12 +1298,10 @@ async def on_message(message):
         )
 
 
-        # =================================================
-        # IMAGE CHECK
-        # =================================================
-
         is_image = False
 
+
+        # Discord content type check
 
         if attachment.content_type:
 
@@ -1004,10 +1349,6 @@ async def on_message(message):
             continue
 
 
-        # =================================================
-        # SCREENSHOT URL
-        # =================================================
-
         screenshot_url = attachment.url
 
 
@@ -1022,7 +1363,18 @@ async def on_message(message):
         # OCR PROCESS
         # =================================================
 
-        amount, confidence = extract_amount(
+        print(
+
+            "Starting OCR..."
+
+        )
+
+
+        # Run blocking OCR separately
+
+        amount, confidence = await asyncio.to_thread(
+
+            extract_amount,
 
             screenshot_url
 
@@ -1057,19 +1409,21 @@ async def on_message(message):
         # SEND TO GOOGLE SHEET
         # =================================================
 
-        send_to_google_sheet(
+        await asyncio.to_thread(
 
-            party_name=party_name,
+            send_to_google_sheet,
 
-            amount=amount,
+            party_name,
 
-            confidence=confidence,
+            amount,
 
-            screenshot_url=screenshot_url,
+            confidence,
 
-            discord_user=str(message.author),
+            screenshot_url,
 
-            message_id=str(message.id)
+            str(message.author),
+
+            str(message.id)
 
         )
 
