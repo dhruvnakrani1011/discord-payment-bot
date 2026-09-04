@@ -2,11 +2,11 @@ import discord
 import requests
 import os
 import json
-import re
+import base64
 from datetime import datetime, timezone, timedelta
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -17,16 +17,18 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.messages = True
 
 client = discord.Client(intents=intents)
 
 
 # ============================================================
-# HELPER - LOG
+# LOG
 # ============================================================
 
-def log(text):
-    print(f"[{datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')}] {text}")
+def log(message):
+    now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {message}", flush=True)
 
 
 # ============================================================
@@ -37,129 +39,199 @@ def download_image(url):
 
     try:
 
-        response = requests.get(url, timeout=30)
+        log("Downloading screenshot...")
 
-        if response.status_code == 200:
-            return response.content
+        response = requests.get(
+            url,
+            timeout=30
+        )
 
-        log(f"Image download failed: {response.status_code}")
-        return None
+        log(f"Download Status: {response.status_code}")
+
+        if response.status_code != 200:
+            return None
+
+        log(f"Image Size: {len(response.content)} bytes")
+
+        return response.content
 
     except Exception as e:
 
-        log(f"Image download error: {e}")
+        log(f"DOWNLOAD ERROR: {str(e)}")
+
         return None
 
 
 # ============================================================
-# GEMINI AI OCR
+# GEMINI IMAGE ANALYSIS
 # ============================================================
 
-def read_payment_screenshot(image_bytes):
+def analyze_image(image_bytes, mime_type):
 
     try:
 
-        import base64
+        log("Starting Gemini AI analysis...")
 
-        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+        image_base64 = base64.b64encode(
+            image_bytes
+        ).decode("utf-8")
+
 
         prompt = """
-You are a payment screenshot data extraction system.
+Analyze this payment screenshot carefully.
 
-Analyze the payment screenshot carefully.
+Extract the following information:
 
-Extract ONLY these details:
+1. Actual successful payment amount
+2. Name of the person or business who received payment
+3. Payment date visible in screenshot
+4. Payment time visible in screenshot
 
-1. Amount paid
-2. Recipient / Party Name
-3. Payment Date if visible
-4. Payment Time if visible
+IMPORTANT:
 
-IMPORTANT RULES:
-
-- The amount must be the actual successful payment amount.
+- Extract ONLY the actual payment amount.
 - Ignore advertisements.
+- Ignore offers.
 - Ignore cashback.
 - Ignore account balance.
-- Ignore transaction IDs.
-- Ignore unrelated numbers.
-- Party name should be the person or business who received the payment.
-- If name is long, extract the complete visible recipient name.
-- Do not invent information.
-- If information is not visible return empty string.
+- Ignore transaction ID.
+- Ignore phone numbers.
+- Ignore random numbers.
+- The party name must be the recipient name after words like:
+  "Paid to"
+  "To"
+  "Payment to"
+  "Sent to"
+- Do not use the sender name.
+- Do not invent data.
 
-Return ONLY valid JSON.
+Return ONLY JSON.
 
-Format:
+Example:
 
 {
-  "amount": "",
-  "party_name": "",
-  "payment_date": "",
-  "payment_time": "",
-  "confidence": ""
+  "amount": "1921.00",
+  "party_name": "Dhadhodra Arvindbhai Boghabhai",
+  "payment_date": "01/09/2026",
+  "payment_time": "04:15 PM"
 }
 """
 
+
         url = (
-            "https://generativelanguage.googleapis.com/v1beta/"
-            "models/gemini-2.5-flash:generateContent"
+            "https://generativelanguage.googleapis.com/"
+            "v1beta/models/gemini-2.5-flash:generateContent"
             f"?key={GEMINI_API_KEY}"
         )
 
+
         payload = {
+
             "contents": [
+
                 {
+
                     "parts": [
+
                         {
+
                             "text": prompt
+
                         },
+
                         {
+
                             "inline_data": {
-                                "mime_type": "image/jpeg",
+
+                                "mime_type": mime_type,
+
                                 "data": image_base64
+
                             }
+
                         }
+
                     ]
+
                 }
+
             ],
+
             "generationConfig": {
+
                 "temperature": 0,
+
                 "responseMimeType": "application/json"
+
             }
+
         }
 
+
+        log("Sending request to Gemini...")
+
         response = requests.post(
+
             url,
+
             json=payload,
-            timeout=60
+
+            timeout=90
+
         )
 
-        log(f"Gemini Status: {response.status_code}")
+
+        log(f"Gemini Status Code: {response.status_code}")
+
 
         if response.status_code != 200:
 
-            log(f"Gemini Error: {response.text}")
+            log("========== GEMINI ERROR ==========")
+
+            log(response.text)
+
+            log("==================================")
+
             return None
+
 
         result = response.json()
 
-        text = result["candidates"][0]["content"]["parts"][0]["text"]
 
-        log(f"Gemini Raw Result: {text}")
+        log("Gemini response received")
 
-        # Remove markdown if Gemini sends it
+
+        try:
+
+            text = result["candidates"][0]["content"]["parts"][0]["text"]
+
+        except Exception:
+
+            log("Could not read Gemini response")
+
+            log(json.dumps(result, indent=2))
+
+            return None
+
+
+        log(f"Gemini Raw Response: {text}")
+
+
         text = text.replace("```json", "")
         text = text.replace("```", "")
         text = text.strip()
 
+
         data = json.loads(text)
+
 
         return data
 
+
     except Exception as e:
 
-        log(f"Gemini Processing Error: {e}")
+        log(f"GEMINI ERROR: {str(e)}")
+
         return None
 
 
@@ -167,47 +239,50 @@ Format:
 # CLEAN AMOUNT
 # ============================================================
 
-def clean_amount(amount):
-
-    if not amount:
-        return ""
-
-    amount = str(amount)
-
-    amount = amount.replace("₹", "")
-    amount = amount.replace(",", "")
-    amount = amount.replace("Rs.", "")
-    amount = amount.replace("INR", "")
-    amount = amount.strip()
+def clean_amount(value):
 
     try:
 
-        value = float(amount)
+        if value is None:
+            return ""
 
-        return round(value, 2)
+        value = str(value)
+
+        value = value.replace("₹", "")
+        value = value.replace(",", "")
+        value = value.replace("INR", "")
+        value = value.replace("Rs.", "")
+        value = value.replace("Rs", "")
+        value = value.strip()
+
+        return float(value)
 
     except:
 
-        return amount
+        return ""
 
 
 # ============================================================
-# SEND DATA TO GOOGLE SHEETS
+# SEND TO GOOGLE SHEET
 # ============================================================
 
-def send_to_google_sheet(
+def send_to_sheet(
     party_name,
     amount,
     screenshot_url,
     discord_user,
     message_id,
-    payment_date="",
-    payment_time=""
+    payment_date,
+    payment_time
 ):
 
     try:
 
+        log("Preparing Google Sheet data...")
+
+
         now = datetime.now(IST)
+
 
         payload = {
 
@@ -229,7 +304,9 @@ def send_to_google_sheet(
 
         }
 
-        log("Sending data to Google Sheet...")
+
+        log("Sending data to Google Apps Script...")
+
 
         response = requests.post(
 
@@ -237,134 +314,248 @@ def send_to_google_sheet(
 
             json=payload,
 
-            timeout=30
+            timeout=60,
+
+            headers={
+
+                "Content-Type": "application/json"
+
+            }
 
         )
 
+
+        log(f"Google Script Status: {response.status_code}")
+
         log(f"Google Script Response: {response.text}")
 
-        return True
+
+        if response.status_code == 200:
+
+            return True
+
+        return False
+
 
     except Exception as e:
 
-        log(f"Google Sheet Error: {e}")
+        log(f"GOOGLE SHEET ERROR: {str(e)}")
 
         return False
 
 
 # ============================================================
-# PROCESS MESSAGE
+# PROCESS PAYMENT
 # ============================================================
 
-async def process_payment_message(message):
+async def process_payment(message):
+
+    log("")
+    log("========================================")
+    log("NEW DISCORD MESSAGE RECEIVED")
+    log("========================================")
+
+    log(f"Message ID: {message.id}")
+
+    log(f"User: {message.author}")
+
+    log(f"Content: {message.content}")
+
+    log(f"Attachments: {len(message.attachments)}")
+
 
     if message.author.bot:
+
+        log("Ignored: Message is from bot")
+
         return
 
-    if not message.attachments:
+
+    if len(message.attachments) == 0:
+
+        log("Ignored: No attachment")
+
         return
 
-    log("=" * 60)
-    log("NEW PAYMENT MESSAGE RECEIVED")
-    log(f"Message ID: {message.id}")
-    log(f"Discord User: {message.author}")
-    log(f"Attachments: {len(message.attachments)}")
 
     attachment = message.attachments[0]
 
-    # Check image
-    if not attachment.content_type:
 
-        filename = attachment.filename.lower()
+    log(f"Filename: {attachment.filename}")
 
-        if not filename.endswith(
-            (".jpg", ".jpeg", ".png", ".webp")
-        ):
-            log("Not an image")
-            return
+    log(f"Content Type: {attachment.content_type}")
 
-    log(f"Processing image: {attachment.filename}")
+    log(f"URL: {attachment.url}")
 
-    image_bytes = download_image(attachment.url)
+
+    filename = attachment.filename.lower()
+
+
+    allowed = (
+
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".webp"
+
+    )
+
+
+    if not filename.endswith(allowed):
+
+        log("Ignored: Attachment is not image")
+
+        return
+
+
+    # MIME TYPE
+
+    if filename.endswith(".png"):
+
+        mime_type = "image/png"
+
+    elif filename.endswith(".webp"):
+
+        mime_type = "image/webp"
+
+    else:
+
+        mime_type = "image/jpeg"
+
+
+    # DOWNLOAD
+
+    image_bytes = download_image(
+        attachment.url
+    )
+
 
     if not image_bytes:
 
-        log("Image could not be downloaded")
+        log("STOPPED: Image download failed")
 
         return
 
-    # ========================================================
-    # AI OCR
-    # ========================================================
 
-    result = read_payment_screenshot(image_bytes)
+    # GEMINI
+
+    result = analyze_image(
+
+        image_bytes,
+
+        mime_type
+
+    )
+
 
     if not result:
 
-        log("FINAL RESULT: NOT FOUND")
+        log("STOPPED: Gemini did not return result")
 
         return
 
-    party_name = result.get("party_name", "")
-    amount = clean_amount(result.get("amount", ""))
 
-    payment_date = result.get("payment_date", "")
-    payment_time = result.get("payment_time", "")
+    log("")
+    log("========== AI RESULT ==========")
 
-    confidence = result.get("confidence", "")
+    log(json.dumps(result, indent=2))
 
-    log("=" * 60)
-    log("AI RESULT")
-    log(f"Party Name: {party_name}")
-    log(f"Amount: {amount}")
-    log(f"Payment Date: {payment_date}")
-    log(f"Payment Time: {payment_time}")
-    log(f"Confidence: {confidence}")
-    log("=" * 60)
+    log("===============================")
 
-    # ========================================================
-    # VALIDATION
-    # ========================================================
+
+    party_name = result.get(
+
+        "party_name",
+
+        ""
+
+    )
+
+
+    amount = clean_amount(
+
+        result.get(
+
+            "amount",
+
+            ""
+
+        )
+
+    )
+
+
+    payment_date = result.get(
+
+        "payment_date",
+
+        ""
+
+    )
+
+
+    payment_time = result.get(
+
+        "payment_time",
+
+        ""
+
+    )
+
 
     if not amount:
 
-        log("Amount not found")
+        log("STOPPED: Amount not found")
 
         return
+
 
     if not party_name:
 
         party_name = "UNKNOWN"
 
-    # ========================================================
-    # SEND TO GOOGLE SHEET
-    # ========================================================
 
-    success = send_to_google_sheet(
+    # GOOGLE SHEET
 
-        party_name=party_name,
+    success = send_to_sheet(
 
-        amount=amount,
+        party_name,
 
-        screenshot_url=attachment.url,
+        amount,
 
-        discord_user=str(message.author),
+        attachment.url,
 
-        message_id=message.id,
+        str(message.author),
 
-        payment_date=payment_date,
+        message.id,
 
-        payment_time=payment_time
+        payment_date,
+
+        payment_time
 
     )
 
+
     if success:
 
-        log("FINAL RESULT: SAVED SUCCESSFULLY")
+        log("")
+
+        log("################################")
+
+        log("FINAL RESULT: PAYMENT SAVED")
+
+        log("################################")
+
 
     else:
 
-        log("FINAL RESULT: GOOGLE SHEET ERROR")
+        log("")
+
+        log("################################")
+
+        log("FINAL RESULT: SHEET SAVE FAILED")
+
+        log("################################")
 
 
 # ============================================================
@@ -374,19 +565,25 @@ async def process_payment_message(message):
 @client.event
 async def on_ready():
 
-    log("=" * 60)
+    log("")
+
+    log("========================================")
+
     log("🤖 DISCORD PAYMENT BOT ACTIVE")
-    log("=" * 60)
+
+    log("========================================")
 
     log(f"Bot Name: {client.user}")
+
     log(f"Bot ID: {client.user.id}")
+
     log(f"Servers: {len(client.guilds)}")
 
-    log("=" * 60)
+    log("========================================")
 
 
 # ============================================================
-# NEW MESSAGE
+# MESSAGE EVENT
 # ============================================================
 
 @client.event
@@ -394,29 +591,35 @@ async def on_message(message):
 
     try:
 
-        await process_payment_message(message)
+        await process_payment(message)
 
     except Exception as e:
 
-        log(f"Message Processing Error: {e}")
+        log(f"UNEXPECTED ERROR: {str(e)}")
 
 
 # ============================================================
-# START BOT
+# START
 # ============================================================
 
 if __name__ == "__main__":
 
+    log("Starting bot...")
+
+
     if not DISCORD_TOKEN:
 
-        raise ValueError("DISCORD_TOKEN not found")
+        raise Exception("DISCORD_TOKEN is missing")
+
 
     if not GEMINI_API_KEY:
 
-        raise ValueError("GEMINI_API_KEY not found")
+        raise Exception("GEMINI_API_KEY is missing")
+
 
     if not GOOGLE_SCRIPT_URL:
 
-        raise ValueError("GOOGLE_SCRIPT_URL not found")
+        raise Exception("GOOGLE_SCRIPT_URL is missing")
+
 
     client.run(DISCORD_TOKEN)
