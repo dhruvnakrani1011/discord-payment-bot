@@ -1,8 +1,7 @@
-discord.py==2.4.0
+discord.py
 requests
 Pillow
 easyocr
 numpy
 torch
 torchvision
-opencv-python-headless
