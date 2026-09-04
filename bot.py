@@ -2,12 +2,13 @@ import os
 import re
 import io
 import asyncio
+from collections import Counter
 
 import discord
 import requests
-import pytesseract
-
+import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter
+import easyocr
 
 
 # =========================================================
@@ -40,173 +41,142 @@ client = discord.Client(intents=intents)
 
 
 # =========================================================
-# IMAGE OCR
+# EASY OCR INITIALIZATION
 # =========================================================
 
-def download_image(image_url):
+print("Loading OCR Engine...")
 
-    response = requests.get(
-        image_url,
-        timeout=30
+reader = easyocr.Reader(
+    ['en'],
+    gpu=False
+)
+
+print("OCR Engine Ready")
+
+
+# =========================================================
+# NUMBER CLEAN FUNCTION
+# =========================================================
+
+def clean_amount(value):
+
+    if not value:
+        return None
+
+    value = str(value)
+
+    # Remove spaces
+    value = value.strip()
+
+    # OCR common mistakes
+    value = value.replace("O", "0")
+    value = value.replace("o", "0")
+
+    # Remove currency
+    value = value.replace("₹", "")
+    value = value.replace("INR", "")
+    value = value.replace("Rs.", "")
+    value = value.replace("Rs", "")
+
+    value = value.strip()
+
+    # Remove unwanted characters
+    value = re.sub(
+        r"[^0-9.,]",
+        "",
+        value
     )
 
-    response.raise_for_status()
-
-    image = Image.open(
-        io.BytesIO(response.content)
-    )
-
-    return image
+    if not value:
+        return None
 
 
-# =========================================================
-# CLEAN AMOUNT
-# =========================================================
-
-def clean_amount(amount):
-
-    if not amount:
-        return ""
-
-    amount = str(amount)
-
-    amount = amount.replace(",", "")
-    amount = amount.replace("₹", "")
-    amount = amount.replace("INR", "")
-    amount = amount.replace(" ", "")
+    # Indian comma format
+    # Example: 1,921.00
 
     try:
 
-        value = float(amount)
+        # If decimal present
+        if "." in value:
 
-        if value.is_integer():
-            return str(int(value))
+            parts = value.split(".")
 
-        return str(value)
+            integer_part = parts[0].replace(",", "")
+            decimal_part = parts[-1]
+
+            if len(decimal_part) > 2:
+                decimal_part = decimal_part[:2]
+
+            number = float(
+                integer_part + "." + decimal_part
+            )
+
+        else:
+
+            number = float(
+                value.replace(",", "")
+            )
+
+
+        # Invalid small/huge numbers reject
+
+        if number <= 0:
+            return None
+
+        if number > 100000000:
+            return None
+
+
+        return round(number, 2)
+
 
     except:
 
-        return ""
+        return None
 
 
 # =========================================================
-# VALID AMOUNT CHECK
+# FORMAT AMOUNT
 # =========================================================
 
-def is_valid_amount(amount):
+def format_amount(amount):
+
+    if amount is None:
+        return None
 
     try:
 
-        value = float(
-            str(amount).replace(",", "")
+        return "{:,.2f}".format(
+            float(amount)
         )
-
-        if value <= 0:
-            return False
-
-        # Payment screenshot mate reasonable limit
-        if value > 100000000:
-            return False
-
-        return True
 
     except:
 
-        return False
+        return None
 
 
 # =========================================================
-# FIND AMOUNT FROM TEXT
-# =========================================================
-
-def find_amount_from_text(text):
-
-    if not text:
-        return ""
-
-
-    text = text.replace("\n", " ")
-
-
-    patterns = [
-
-        # ₹15,000
-        r'₹\s*([\d,]+(?:\.\d{1,2})?)',
-
-        # Rs. 15000
-        r'Rs\.?\s*([\d,]+(?:\.\d{1,2})?)',
-
-        # INR 15000
-        r'INR\s*([\d,]+(?:\.\d{1,2})?)',
-
-        # Amount ₹15000
-        r'Amount\s*[:\-]?\s*₹?\s*([\d,]+(?:\.\d{1,2})?)',
-
-        # Paid ₹15000
-        r'Paid\s*[:\-]?\s*₹?\s*([\d,]+(?:\.\d{1,2})?)',
-
-        # Payment ₹15000
-        r'Payment\s*[:\-]?\s*₹?\s*([\d,]+(?:\.\d{1,2})?)',
-
-        # Total ₹15000
-        r'Total\s*[:\-]?\s*₹?\s*([\d,]+(?:\.\d{1,2})?)',
-
-        # Transaction amount
-        r'Transaction\s*Amount\s*[:\-]?\s*₹?\s*([\d,]+(?:\.\d{1,2})?)'
-
-    ]
-
-
-    for pattern in patterns:
-
-        matches = re.findall(
-            pattern,
-            text,
-            re.IGNORECASE
-        )
-
-        for match in matches:
-
-            amount = clean_amount(match)
-
-            if is_valid_amount(amount):
-
-                print(
-                    f"AMOUNT FOUND BY PATTERN: {amount}"
-                )
-
-                return amount
-
-
-    return ""
-
-
-# =========================================================
-# OCR PREPROCESS
+# PREPROCESS IMAGE
 # =========================================================
 
 def preprocess_image(image):
 
-    image = image.convert("RGB")
+    # Convert RGB
 
-    # Resize
-    width, height = image.size
+    if image.mode != "RGB":
 
-    new_width = width * 2
-    new_height = height * 2
-
-    image = image.resize(
-        (new_width, new_height)
-    )
+        image = image.convert("RGB")
 
 
     # Enhance contrast
+
     enhancer = ImageEnhance.Contrast(image)
 
-    image = enhancer.enhance(2)
+    image = enhancer.enhance(1.8)
 
 
     # Enhance sharpness
+
     enhancer = ImageEnhance.Sharpness(image)
 
     image = enhancer.enhance(2)
@@ -216,7 +186,371 @@ def preprocess_image(image):
 
 
 # =========================================================
-# EXTRACT AMOUNT
+# OCR IMAGE
+# =========================================================
+
+def run_ocr(image):
+
+    try:
+
+        image_np = np.array(image)
+
+
+        results = reader.readtext(
+            image_np,
+            detail=1,
+            paragraph=False
+        )
+
+
+        texts = []
+
+
+        for result in results:
+
+            bbox = result[0]
+
+            text = result[1]
+
+            confidence = result[2]
+
+
+            texts.append({
+
+                "text": text,
+
+                "confidence": confidence,
+
+                "bbox": bbox
+
+            })
+
+
+        return texts
+
+
+    except Exception as e:
+
+        print("OCR ERROR:", e)
+
+        return []
+
+
+# =========================================================
+# EXTRACT AMOUNT FROM TEXT
+# =========================================================
+
+def find_amount_candidates(ocr_results):
+
+    candidates = []
+
+
+    for item in ocr_results:
+
+        text = item["text"]
+
+        confidence = item["confidence"]
+
+
+        print(
+            f"OCR: {text} | Confidence: {confidence:.2f}"
+        )
+
+
+        # -----------------------------------------
+        # Pattern 1
+        # ₹1,921.00
+        # ₹ 15,000
+        # -----------------------------------------
+
+        patterns = [
+
+            r'₹\s*([0-9OolI,]+(?:\.[0-9]{1,2})?)',
+
+            # Rs 1500
+
+            r'Rs\.?\s*([0-9OolI,]+(?:\.[0-9]{1,2})?)',
+
+            # INR 1500
+
+            r'INR\s*([0-9OolI,]+(?:\.[0-9]{1,2})?)',
+
+            # Amount 1500
+
+            r'(?:Amount|Paid|Payment|Total|Debited|Credited)'
+            r'[:\s]*₹?\s*'
+            r'([0-9OolI,]+(?:\.[0-9]{1,2})?)'
+        ]
+
+
+        for pattern in patterns:
+
+            matches = re.findall(
+                pattern,
+                text,
+                re.IGNORECASE
+            )
+
+
+            for match in matches:
+
+                amount = clean_amount(match)
+
+
+                if amount:
+
+                    candidates.append({
+
+                        "amount": amount,
+
+                        "confidence": confidence,
+
+                        "source": text,
+
+                        "priority": "currency"
+                    })
+
+
+        # -----------------------------------------
+        # Plain amount detection
+        # Example:
+        # 1,921.00
+        # 15,000
+        # -----------------------------------------
+
+        plain_matches = re.findall(
+
+            r'\b\d{1,3}(?:,\d{2,3})+(?:\.\d{1,2})?\b',
+
+            text
+
+        )
+
+
+        for match in plain_matches:
+
+            amount = clean_amount(match)
+
+
+            if amount:
+
+                candidates.append({
+
+                    "amount": amount,
+
+                    "confidence": confidence * 0.8,
+
+                    "source": text,
+
+                    "priority": "plain"
+                })
+
+
+    return candidates
+
+
+# =========================================================
+# FILTER BAD NUMBERS
+# =========================================================
+
+def is_valid_payment_amount(amount):
+
+    if amount is None:
+        return False
+
+
+    # Very small random OCR values ignore
+
+    if amount < 1:
+        return False
+
+
+    # Unrealistically huge
+
+    if amount > 10000000:
+        return False
+
+
+    return True
+
+
+# =========================================================
+# IMAGE CROP OCR
+# =========================================================
+
+def create_crops(image):
+
+    width, height = image.size
+
+
+    crops = []
+
+
+    # Full Image
+
+    crops.append(
+        ("FULL", image)
+    )
+
+
+    # Top 50%
+
+    crops.append(
+
+        (
+            "TOP_HALF",
+
+            image.crop(
+                (
+                    0,
+                    0,
+                    width,
+                    int(height * 0.50)
+                )
+            )
+        )
+    )
+
+
+    # Top 65%
+
+    crops.append(
+
+        (
+            "TOP_65",
+
+            image.crop(
+                (
+                    0,
+                    0,
+                    width,
+                    int(height * 0.65)
+                )
+            )
+        )
+    )
+
+
+    # Top center
+
+    crops.append(
+
+        (
+            "TOP_CENTER",
+
+            image.crop(
+                (
+                    int(width * 0.10),
+                    int(height * 0.05),
+                    int(width * 0.90),
+                    int(height * 0.55)
+                )
+            )
+        )
+    )
+
+
+    # Center Area
+
+    crops.append(
+
+        (
+            "CENTER",
+
+            image.crop(
+                (
+                    int(width * 0.05),
+                    int(height * 0.15),
+                    int(width * 0.95),
+                    int(height * 0.70)
+                )
+            )
+        )
+    )
+
+
+    return crops
+
+
+# =========================================================
+# SMART AMOUNT SELECTOR
+# =========================================================
+
+def choose_best_amount(all_candidates):
+
+    if not all_candidates:
+
+        return None, 0
+
+
+    valid_candidates = []
+
+
+    for item in all_candidates:
+
+        amount = item["amount"]
+
+
+        if is_valid_payment_amount(amount):
+
+            valid_candidates.append(item)
+
+
+    if not valid_candidates:
+
+        return None, 0
+
+
+    # Group same amounts
+
+    amount_scores = {}
+
+
+    for item in valid_candidates:
+
+        amount = item["amount"]
+
+        score = item["confidence"]
+
+
+        # Currency amount gets priority
+
+        if item["priority"] == "currency":
+
+            score += 0.5
+
+
+        if amount not in amount_scores:
+
+            amount_scores[amount] = 0
+
+
+        amount_scores[amount] += score
+
+
+    # Sort
+
+    sorted_amounts = sorted(
+
+        amount_scores.items(),
+
+        key=lambda x: x[1],
+
+        reverse=True
+
+    )
+
+
+    best_amount = sorted_amounts[0][0]
+
+    best_score = sorted_amounts[0][1]
+
+
+    return best_amount, best_score
+
+
+# =========================================================
+# MAIN OCR FUNCTION
 # =========================================================
 
 def extract_amount(image_url):
@@ -225,154 +559,149 @@ def extract_amount(image_url):
 
         print("")
         print("========================================")
-        print("STARTING PAYMENT OCR")
+        print("DOWNLOADING SCREENSHOT")
         print("========================================")
 
 
-        image = download_image(image_url)
+        response = requests.get(
 
+            image_url,
+
+            timeout=30
+
+        )
+
+
+        response.raise_for_status()
+
+
+        image = Image.open(
+
+            io.BytesIO(response.content)
+
+        )
+
+
+        print(
+            f"Image Size: {image.size}"
+        )
+
+
+        # Preprocess
 
         image = preprocess_image(image)
 
 
-        # Different OCR modes
-        psm_modes = [
+        # Create image crops
 
-            6,
-            11,
-            12
-
-        ]
+        crops = create_crops(image)
 
 
-        all_text = ""
+        all_candidates = []
 
 
-        for mode in psm_modes:
+        # ----------------------------------------
+        # OCR EVERY CROP
+        # ----------------------------------------
 
-            try:
+        for crop_name, crop_image in crops:
 
-                print(
-                    f"Running OCR Mode {mode}..."
+
+            print("")
+            print("========================================")
+
+            print(
+                f"RUNNING OCR: {crop_name}"
+            )
+
+            print("========================================")
+
+
+            results = run_ocr(
+                crop_image
+            )
+
+
+            candidates = find_amount_candidates(
+                results
+            )
+
+
+            for candidate in candidates:
+
+                candidate["crop"] = crop_name
+
+                all_candidates.append(
+                    candidate
                 )
 
 
-                text = pytesseract.image_to_string(
+        # ----------------------------------------
+        # PRINT ALL FOUND AMOUNTS
+        # ----------------------------------------
 
-                    image,
+        print("")
+        print("========================================")
 
-                    config=f'--psm {mode}'
+        print("ALL AMOUNT CANDIDATES")
 
-                )
-
-
-                print("")
-                print(
-                    f"========== OCR MODE {mode} =========="
-                )
-
-                print(text)
-
-                print(
-                    "======================================"
-                )
+        print("========================================")
 
 
-                all_text += "\n" + text
+        for item in all_candidates:
+
+            print(
+
+                f"Amount: {item['amount']} | "
+                f"Confidence: {item['confidence']:.2f} | "
+                f"Crop: {item['crop']} | "
+                f"Text: {item['source']}"
+
+            )
 
 
-                amount = find_amount_from_text(text)
+        # ----------------------------------------
+        # SELECT BEST AMOUNT
+        # ----------------------------------------
 
+        amount, score = choose_best_amount(
 
-                if amount:
+            all_candidates
 
-                    print(
-                        f"FINAL AMOUNT FOUND: {amount}"
-                    )
-
-                    return amount
-
-
-            except Exception as e:
-
-                print(
-                    f"OCR Error Mode {mode}: {e}"
-                )
-
-
-        # Final search in combined text
-
-        amount = find_amount_from_text(
-            all_text
         )
 
 
         if amount:
 
-            return amount
 
-
-        # =================================================
-        # FALLBACK:
-        # Find large numbers from OCR
-        # =================================================
-
-        numbers = re.findall(
-
-            r'(?<![A-Za-z0-9])(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d{3,9}(?:\.\d{1,2})?)(?![A-Za-z0-9])',
-
-            all_text
-
-        )
-
-
-        valid_numbers = []
-
-
-        for number in numbers:
-
-            amount = clean_amount(number)
-
-
-            if is_valid_amount(amount):
-
-                value = float(amount)
-
-                # Ignore probable years
-                if 2000 <= value <= 2100:
-
-                    continue
-
-
-                valid_numbers.append(value)
-
-
-        if valid_numbers:
-
-            # Screenshot ma usually largest payment amount hoy
-            best_amount = max(valid_numbers)
-
-
-            if best_amount.is_integer():
-
-                best_amount = str(
-                    int(best_amount)
-                )
-
-            else:
-
-                best_amount = str(best_amount)
-
-
-            print(
-                f"FALLBACK AMOUNT FOUND: {best_amount}"
+            final_amount = format_amount(
+                amount
             )
 
 
-            return best_amount
+            print("")
+            print("========================================")
 
+            print(
+                f"FINAL AMOUNT: {final_amount}"
+            )
+
+            print(
+                f"FINAL SCORE: {score}"
+            )
+
+            print("========================================")
+
+
+            return final_amount
+
+
+        print("")
+        print("========================================")
 
         print("FINAL RESULT: NOT FOUND")
+
+        print("========================================")
 
 
         return "NOT FOUND"
@@ -380,42 +709,59 @@ def extract_amount(image_url):
 
     except Exception as e:
 
-        print(
-            f"FINAL OCR ERROR: {e}"
-        )
+
+        print("")
+        print("========================================")
+
+        print("OCR FATAL ERROR")
+
+        print(e)
+
+        print("========================================")
+
 
         return "NOT FOUND"
 
 
 # =========================================================
-# GOOGLE SHEET - NEW ENTRY
+# GOOGLE SHEET ENTRY
 # =========================================================
 
 def send_to_google_sheet(
 
     party_name,
+
     amount,
+
     screenshot_url,
+
     discord_user,
+
     message_id
 
 ):
 
+
     try:
+
 
         data = {
 
-            "action": "new",
 
             "secret": SECRET_KEY,
 
+
             "partyName": party_name,
+
 
             "amount": amount,
 
+
             "screenshot": screenshot_url,
 
+
             "discordUser": discord_user,
+
 
             "messageId": message_id
 
@@ -423,7 +769,13 @@ def send_to_google_sheet(
 
 
         print("")
-        print("Sending NEW entry to Google Sheet...")
+        print("========================================")
+
+        print("SENDING TO GOOGLE SHEET")
+
+        print(data)
+
+        print("========================================")
 
 
         response = requests.post(
@@ -437,98 +789,19 @@ def send_to_google_sheet(
         )
 
 
-        print(
-            "Google Sheet Response:"
-        )
+        print("GOOGLE SHEET RESPONSE:")
 
-        print(
-            response.text
-        )
+        print(response.status_code)
 
-
-        return True
+        print(response.text)
 
 
     except Exception as e:
 
-        print(
-            f"Google Sheet Error: {e}"
-        )
 
-        return False
+        print("GOOGLE SHEET ERROR:")
 
-
-# =========================================================
-# GOOGLE SHEET - UPDATE PARTY NAME
-# =========================================================
-
-def update_party_in_google_sheet(
-
-    party_name,
-    message_id,
-    discord_user
-
-):
-
-    try:
-
-        data = {
-
-            "action": "update_party",
-
-            "secret": SECRET_KEY,
-
-            "partyName": party_name,
-
-            "discordUser": discord_user,
-
-            "messageId": message_id
-
-        }
-
-
-        print("")
-        print("Updating Party Name in Google Sheet...")
-
-        print(
-            f"New Party Name: {party_name}"
-        )
-
-        print(
-            f"Message ID: {message_id}"
-        )
-
-
-        response = requests.post(
-
-            GOOGLE_SCRIPT_URL,
-
-            json=data,
-
-            timeout=30
-
-        )
-
-
-        print(
-            "Google Sheet Update Response:"
-        )
-
-        print(
-            response.text
-        )
-
-
-        return True
-
-
-    except Exception as e:
-
-        print(
-            f"Google Sheet Update Error: {e}"
-        )
-
-        return False
+        print(e)
 
 
 # =========================================================
@@ -538,10 +811,14 @@ def update_party_in_google_sheet(
 @client.event
 async def on_ready():
 
+
     print("")
-    print("======================================")
+
+    print("========================================")
+
     print("🤖 DISCORD PAYMENT BOT ACTIVE")
-    print("======================================")
+
+    print("========================================")
 
     print(
         f"Bot Name: {client.user}"
@@ -555,7 +832,24 @@ async def on_ready():
         f"Servers: {len(client.guilds)}"
     )
 
-    print("======================================")
+    print("========================================")
+
+    print("")
+
+
+# =========================================================
+# BOT JOIN SERVER
+# =========================================================
+
+@client.event
+async def on_guild_join(guild):
+
+
+    print("")
+
+    print(
+        f"Joined Server: {guild.name}"
+    )
 
 
 # =========================================================
@@ -566,36 +860,61 @@ async def on_ready():
 async def on_message(message):
 
 
-    # Bot messages ignore
+    # -----------------------------------------
+    # Ignore Bot Messages
+    # -----------------------------------------
 
     if message.author.bot:
 
         return
 
 
-    # Screenshot nathi
+    # -----------------------------------------
+    # No attachment
+    # -----------------------------------------
 
     if not message.attachments:
 
         return
 
 
+    # -----------------------------------------
     # Party Name
+    # -----------------------------------------
 
     party_name = message.content.strip()
 
 
     if not party_name:
 
-        print("Party Name Missing")
+
+        print("")
+
+        print("========================================")
+
+        print("PARTY NAME MISSING")
+
+        print(
+            f"Message ID: {message.id}"
+        )
+
+        print("========================================")
+
 
         return
 
 
+    # -----------------------------------------
+    # Message Info
+    # -----------------------------------------
+
     print("")
-    print("======================================")
-    print("NEW PAYMENT MESSAGE DETECTED")
-    print("======================================")
+
+    print("========================================")
+
+    print("NEW PAYMENT MESSAGE")
+
+    print("========================================")
 
     print(
         f"Party Name: {party_name}"
@@ -613,62 +932,90 @@ async def on_message(message):
         f"Attachments: {len(message.attachments)}"
     )
 
-    print("======================================")
+    print("========================================")
 
 
-    # All attachments
+    # -----------------------------------------
+    # PROCESS ALL ATTACHMENTS
+    # -----------------------------------------
 
     for attachment in message.attachments:
 
 
-        # Image check
+        # Check image
+
 
         is_image = False
 
 
         if attachment.content_type:
 
-            if attachment.content_type.startswith(
-                "image"
+
+            if attachment.content_type.startswith("image"):
+
+                is_image = True
+
+
+        # If Discord content type missing
+
+
+        if not is_image:
+
+
+            filename = attachment.filename.lower()
+
+
+            if filename.endswith(
+
+                (
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".webp"
+                )
+
             ):
 
                 is_image = True
 
 
-        # File extension fallback
-
-        filename = attachment.filename.lower()
-
-
-        image_extensions = (
-
-            ".jpg",
-            ".jpeg",
-            ".png",
-            ".webp"
-
-        )
-
-
-        if filename.endswith(image_extensions):
-
-            is_image = True
-
-
         if not is_image:
+
+            print(
+
+                f"Skipping non-image: "
+                f"{attachment.filename}"
+
+            )
 
             continue
 
 
+        # -------------------------------------
+        # PROCESS IMAGE
+        # -------------------------------------
+
         screenshot_url = attachment.url
 
 
+        print("")
+
+        print("========================================")
+
         print(
-            f"Processing: {filename}"
+            f"PROCESSING IMAGE: {attachment.filename}"
         )
 
+        print(
+            f"Screenshot URL: {screenshot_url}"
+        )
 
-        # OCR BLOCKING HOY ETLE THREAD MA RUN KARO
+        print("========================================")
+
+
+        # OCR in separate thread
+        # Bot freeze na thay
+
 
         amount = await asyncio.to_thread(
 
@@ -679,12 +1026,9 @@ async def on_message(message):
         )
 
 
-        print(
-            f"FINAL PAYMENT AMOUNT: {amount}"
-        )
-
-
-        # Google Sheet entry
+        # -------------------------------------
+        # SEND TO GOOGLE SHEET
+        # -------------------------------------
 
         await asyncio.to_thread(
 
@@ -703,139 +1047,25 @@ async def on_message(message):
         )
 
 
-        # Only first screenshot process
+        print("")
 
-        break
+        print("========================================")
 
-
-# =========================================================
-# MESSAGE EDIT DETECTION
-# =========================================================
-
-@client.event
-async def on_message_edit(before, after):
-
-
-    # Bot messages ignore
-
-    if after.author.bot:
-
-        return
-
-
-    # Party name change check
-
-    old_party_name = before.content.strip()
-
-    new_party_name = after.content.strip()
-
-
-    # Same text hoy to kai karvanu nahi
-
-    if old_party_name == new_party_name:
-
-        return
-
-
-    # New name blank hoy to ignore
-
-    if not new_party_name:
+        print("PAYMENT PROCESS COMPLETED")
 
         print(
-            "Edited Party Name is blank"
+            f"Party: {party_name}"
         )
-
-        return
-
-
-    print("")
-    print("======================================")
-    print("MESSAGE EDIT DETECTED")
-    print("======================================")
-
-    print(
-        f"OLD PARTY: {old_party_name}"
-    )
-
-    print(
-        f"NEW PARTY: {new_party_name}"
-    )
-
-    print(
-        f"MESSAGE ID: {after.id}"
-    )
-
-    print(
-        f"USER: {after.author}"
-    )
-
-    print("======================================")
-
-
-    # Google Sheet update
-
-    result = await asyncio.to_thread(
-
-        update_party_in_google_sheet,
-
-        new_party_name,
-
-        str(after.id),
-
-        str(after.author)
-
-    )
-
-
-    if result:
 
         print(
-            "PARTY NAME UPDATED SUCCESSFULLY"
+            f"Amount: {amount}"
         )
-
-    else:
 
         print(
-            "PARTY NAME UPDATE FAILED"
+            f"Message ID: {message.id}"
         )
 
-
-# =========================================================
-# MESSAGE DELETE LOG
-# =========================================================
-
-@client.event
-async def on_message_delete(message):
-
-
-    if message.author.bot:
-
-        return
-
-
-    if not message.attachments:
-
-        return
-
-
-    print("")
-    print("======================================")
-    print("PAYMENT MESSAGE DELETED")
-    print("======================================")
-
-    print(
-        f"Party: {message.content}"
-    )
-
-    print(
-        f"Message ID: {message.id}"
-    )
-
-    print(
-        f"Deleted By/Author: {message.author}"
-    )
-
-    print("======================================")
+        print("========================================")
 
 
 # =========================================================
@@ -844,9 +1074,13 @@ async def on_message_delete(message):
 
 if __name__ == "__main__":
 
+
     print("")
-    print("======================================")
-    print("Starting Discord Payment Bot...")
-    print("======================================")
+
+    print("========================================")
+
+    print("STARTING DISCORD PAYMENT BOT")
+
+    print("========================================")
 
     client.run(DISCORD_TOKEN)
