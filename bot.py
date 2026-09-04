@@ -2,15 +2,16 @@ import os
 import re
 import io
 import asyncio
+
 import discord
 import requests
 import pytesseract
 
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageEnhance, ImageFilter
 
 
 # =========================================================
-# ENVIRONMENT VARIABLES
+# SETTINGS
 # =========================================================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -39,125 +40,72 @@ client = discord.Client(intents=intents)
 
 
 # =========================================================
-# PAYMENT KEYWORDS
+# IMAGE OCR
 # =========================================================
 
-STRONG_KEYWORDS = [
+def download_image(image_url):
 
-    "amount",
-    "paid",
-    "payment",
-    "you paid",
-    "you sent",
-    "sent",
-    "successfully paid",
-    "payment successful",
-    "payment successful!",
-    "paid successfully",
-    "transfer amount",
-    "transaction amount",
-    "debited",
-    "credited",
-    "money sent",
-    "money transferred",
-    "payment done",
-    "transfer successful",
-    "successfully sent"
+    response = requests.get(
+        image_url,
+        timeout=30
+    )
 
-]
+    response.raise_for_status()
 
+    image = Image.open(
+        io.BytesIO(response.content)
+    )
 
-MEDIUM_KEYWORDS = [
-
-    "upi",
-    "transfer",
-    "success",
-    "successful",
-    "completed",
-    "transaction",
-    "expense",
-    "paid to",
-    "sent to"
-
-]
-
-
-# =========================================================
-# BAD KEYWORDS
-# =========================================================
-
-BAD_KEYWORDS = [
-
-    "transaction id",
-    "txn id",
-    "utr",
-    "reference",
-    "upi ref",
-    "upi reference",
-    "account number",
-    "account no",
-    "mobile",
-    "phone",
-    "contact",
-    "ifsc",
-    "rrn",
-    "balance",
-    "available balance",
-    "kotak txn id",
-    "transaction number"
-
-]
+    return image
 
 
 # =========================================================
 # CLEAN AMOUNT
 # =========================================================
 
-def clean_amount(value):
+def clean_amount(amount):
 
-    if not value:
+    if not amount:
         return ""
 
-    value = str(value)
+    amount = str(amount)
 
-    value = value.replace("₹", "")
-    value = value.replace("Rs.", "")
-    value = value.replace("Rs", "")
-    value = value.replace("INR", "")
-    value = value.replace("inr", "")
+    amount = amount.replace(",", "")
+    amount = amount.replace("₹", "")
+    amount = amount.replace("INR", "")
+    amount = amount.replace(" ", "")
 
-    value = value.replace(",", "")
-    value = value.replace(" ", "")
+    try:
 
-    value = value.replace("-", "")
-    value = value.replace("–", "")
-    value = value.replace("—", "")
+        value = float(amount)
 
-    value = re.sub(r"[^\d.]", "", value)
+        if value.is_integer():
+            return str(int(value))
 
-    if value.count(".") > 1:
+        return str(value)
 
-        parts = value.split(".")
+    except:
 
-        value = parts[0] + "." + parts[1]
-
-    return value
+        return ""
 
 
 # =========================================================
 # VALID AMOUNT CHECK
 # =========================================================
 
-def is_valid_amount(value):
+def is_valid_amount(amount):
 
     try:
 
-        number = float(value)
+        value = float(
+            str(amount).replace(",", "")
+        )
 
-        if number < 1:
+        if value <= 0:
             return False
 
-        if number > 10000000:
+        # Payment screenshot mate reasonable limit
+        if value > 100000000:
             return False
 
         return True
@@ -168,978 +116,302 @@ def is_valid_amount(value):
 
 
 # =========================================================
-# SUSPICIOUS NUMBER CHECK
+# FIND AMOUNT FROM TEXT
 # =========================================================
 
-def is_suspicious_number(number):
+def find_amount_from_text(text):
 
-    digits = re.sub(r"\D", "", str(number))
-
-    if not digits:
-        return True
+    if not text:
+        return ""
 
 
-    # Mobile number
-    if len(digits) == 10:
+    text = text.replace("\n", " ")
 
-        return True
-
-
-    # Long transaction / reference numbers
-    if len(digits) >= 11:
-
-        return True
-
-
-    # Years
-    if digits in [
-
-        "2023",
-        "2024",
-        "2025",
-        "2026",
-        "2027",
-        "2028",
-        "2029",
-        "2030"
-
-    ]:
-
-        return True
-
-
-    # Very common time values
-    if len(digits) == 4:
-
-        try:
-
-            num = int(digits)
-
-            # HHMM possible time
-            hour = num // 100
-            minute = num % 100
-
-            if hour <= 23 and minute <= 59:
-
-                return True
-
-        except:
-
-            pass
-
-
-    return False
-
-
-# =========================================================
-# DATE CHECK
-# =========================================================
-
-def is_date_line(line):
 
     patterns = [
 
-        r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b',
+        # ₹15,000
+        r'₹\s*([\d,]+(?:\.\d{1,2})?)',
 
-        r'\b\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)',
+        # Rs. 15000
+        r'Rs\.?\s*([\d,]+(?:\.\d{1,2})?)',
 
-        r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b'
+        # INR 15000
+        r'INR\s*([\d,]+(?:\.\d{1,2})?)',
+
+        # Amount ₹15000
+        r'Amount\s*[:\-]?\s*₹?\s*([\d,]+(?:\.\d{1,2})?)',
+
+        # Paid ₹15000
+        r'Paid\s*[:\-]?\s*₹?\s*([\d,]+(?:\.\d{1,2})?)',
+
+        # Payment ₹15000
+        r'Payment\s*[:\-]?\s*₹?\s*([\d,]+(?:\.\d{1,2})?)',
+
+        # Total ₹15000
+        r'Total\s*[:\-]?\s*₹?\s*([\d,]+(?:\.\d{1,2})?)',
+
+        # Transaction amount
+        r'Transaction\s*Amount\s*[:\-]?\s*₹?\s*([\d,]+(?:\.\d{1,2})?)'
 
     ]
 
 
     for pattern in patterns:
 
-        if re.search(pattern, line.lower()):
-
-            return True
-
-
-    return False
-
-
-# =========================================================
-# EXTRACT NUMBER CANDIDATES
-# =========================================================
-
-def find_numbers_in_line(line):
-
-    results = []
-
-
-    # Currency amount patterns
-    currency_patterns = [
-
-        r'[-–—]?\s*₹\s*[\d,]+(?:\.\d{1,2})?',
-
-        r'[-–—]?\s*(?:rs\.?|inr)\s*[\d,]+(?:\.\d{1,2})?',
-
-        r'₹\s*[\d,]+(?:\.\d{1,2})?',
-
-        r'(?:rs\.?|inr)\s*[\d,]+(?:\.\d{1,2})?'
-
-    ]
-
-
-    for pattern in currency_patterns:
-
         matches = re.findall(
-
             pattern,
-
-            line,
-
+            text,
             re.IGNORECASE
-
         )
-
 
         for match in matches:
 
-            results.append({
+            amount = clean_amount(match)
 
-                "raw": match,
+            if is_valid_amount(amount):
 
-                "currency": True
+                print(
+                    f"AMOUNT FOUND BY PATTERN: {amount}"
+                )
 
-            })
-
-
-    # Normal numbers
-    normal_pattern = r'(?<![\d/])\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?(?![\d/])'
-
-    matches = re.findall(normal_pattern, line)
+                return amount
 
 
-    for match in matches:
-
-        results.append({
-
-            "raw": match,
-
-            "currency": False
-
-        })
-
-
-    # Plain number only if short enough
-    plain_pattern = r'(?<![\d/])\d+(?:\.\d{1,2})?(?![\d/])'
-
-    matches = re.findall(plain_pattern, line)
-
-
-    for match in matches:
-
-        # Avoid duplicates
-        already = False
-
-        for item in results:
-
-            if clean_amount(item["raw"]) == clean_amount(match):
-
-                already = True
-
-                break
-
-
-        if not already:
-
-            results.append({
-
-                "raw": match,
-
-                "currency": False
-
-            })
-
-
-    return results
+    return ""
 
 
 # =========================================================
-# SCORE CANDIDATE
-# =========================================================
-
-def calculate_score(
-
-    raw_number,
-    line,
-    previous_line,
-    next_line,
-    line_index,
-    is_top_area
-
-):
-
-    score = 0
-
-    line_lower = line.lower()
-
-    previous_lower = previous_line.lower()
-
-    next_lower = next_line.lower()
-
-
-    # =====================================================
-    # CURRENCY BONUS
-    # =====================================================
-
-    if "₹" in raw_number:
-
-        score += 500
-
-
-    if "rs" in raw_number.lower():
-
-        score += 400
-
-
-    if "inr" in raw_number.lower():
-
-        score += 400
-
-
-    # =====================================================
-    # STRONG KEYWORD SAME LINE
-    # =====================================================
-
-    for keyword in STRONG_KEYWORDS:
-
-        if keyword in line_lower:
-
-            score += 200
-
-
-    # =====================================================
-    # MEDIUM KEYWORD SAME LINE
-    # =====================================================
-
-    for keyword in MEDIUM_KEYWORDS:
-
-        if keyword in line_lower:
-
-            score += 50
-
-
-    # =====================================================
-    # PREVIOUS LINE
-    # =====================================================
-
-    for keyword in STRONG_KEYWORDS:
-
-        if keyword in previous_lower:
-
-            score += 100
-
-
-    for keyword in MEDIUM_KEYWORDS:
-
-        if keyword in previous_lower:
-
-            score += 25
-
-
-    # =====================================================
-    # NEXT LINE
-    # =====================================================
-
-    for keyword in STRONG_KEYWORDS:
-
-        if keyword in next_lower:
-
-            score += 100
-
-
-    for keyword in MEDIUM_KEYWORDS:
-
-        if keyword in next_lower:
-
-            score += 25
-
-
-    # =====================================================
-    # BAD KEYWORDS
-    # =====================================================
-
-    for keyword in BAD_KEYWORDS:
-
-        if keyword in line_lower:
-
-            score -= 500
-
-
-    for keyword in BAD_KEYWORDS:
-
-        if keyword in previous_lower:
-
-            score -= 200
-
-
-    # =====================================================
-    # DATE PENALTY
-    # =====================================================
-
-    if is_date_line(line):
-
-        score -= 300
-
-
-    # =====================================================
-    # TOP AREA BONUS
-    # =====================================================
-
-    if is_top_area:
-
-        score += 100
-
-
-    # First few OCR lines generally payment summary
-    if line_index <= 6:
-
-        score += 30
-
-
-    return score
-
-
-# =========================================================
-# EXTRACT CANDIDATES
-# =========================================================
-
-def extract_candidates(text, is_top_area=False):
-
-    candidates = []
-
-    lines = text.splitlines()
-
-
-    for index, line in enumerate(lines):
-
-        line = line.strip()
-
-
-        if not line:
-
-            continue
-
-
-        previous_line = ""
-
-        next_line = ""
-
-
-        if index > 0:
-
-            previous_line = lines[index - 1]
-
-
-        if index < len(lines) - 1:
-
-            next_line = lines[index + 1]
-
-
-        numbers = find_numbers_in_line(line)
-
-
-        for item in numbers:
-
-
-            raw_number = item["raw"]
-
-
-            amount = clean_amount(raw_number)
-
-
-            if not amount:
-
-                continue
-
-
-            if not is_valid_amount(amount):
-
-                continue
-
-
-            if is_suspicious_number(amount):
-
-                continue
-
-
-            # If line looks like date and no currency symbol,
-            # reject it completely
-
-            if is_date_line(line) and not item["currency"]:
-
-                continue
-
-
-            score = calculate_score(
-
-                raw_number=raw_number,
-
-                line=line,
-
-                previous_line=previous_line,
-
-                next_line=next_line,
-
-                line_index=index,
-
-                is_top_area=is_top_area
-
-            )
-
-
-            # Currency explicitly found
-            if item["currency"]:
-
-                score += 300
-
-
-            candidate = {
-
-                "amount": amount,
-
-                "score": score,
-
-                "line": line,
-
-                "raw": raw_number,
-
-                "currency": item["currency"]
-
-            }
-
-
-            candidates.append(candidate)
-
-
-    return candidates
-
-
-# =========================================================
-# REMOVE DUPLICATE CANDIDATES
-# =========================================================
-
-def remove_duplicate_candidates(candidates):
-
-    best_candidates = {}
-
-
-    for candidate in candidates:
-
-
-        amount = candidate["amount"]
-
-
-        if amount not in best_candidates:
-
-            best_candidates[amount] = candidate
-
-
-        else:
-
-
-            if candidate["score"] > best_candidates[amount]["score"]:
-
-                best_candidates[amount] = candidate
-
-
-    return list(best_candidates.values())
-
-
-# =========================================================
-# SELECT BEST AMOUNT
-# =========================================================
-
-def select_best_amount(candidates):
-
-    if not candidates:
-
-        return "", 0
-
-
-    candidates = remove_duplicate_candidates(candidates)
-
-
-    candidates = sorted(
-
-        candidates,
-
-        key=lambda x: x["score"],
-
-        reverse=True
-
-    )
-
-
-    print("\n========== ALL AMOUNT CANDIDATES ==========")
-
-
-    for candidate in candidates:
-
-        print(
-
-            f"Amount: {candidate['amount']} | "
-
-            f"Score: {candidate['score']} | "
-
-            f"Currency: {candidate['currency']} | "
-
-            f"Line: {candidate['line']}"
-
-        )
-
-
-    print("============================================\n")
-
-
-    best = candidates[0]
-
-
-    # Very low confidence reject
-
-    if best["score"] < 50:
-
-        return "NOT FOUND", 0
-
-
-    return best["amount"], best["score"]
-
-
-# =========================================================
-# PREPROCESS IMAGE
+# OCR PREPROCESS
 # =========================================================
 
 def preprocess_image(image):
 
-
     image = image.convert("RGB")
 
-
+    # Resize
     width, height = image.size
 
+    new_width = width * 2
+    new_height = height * 2
 
-    # Resize small screenshots
-
-    if width < 1800:
-
-
-        scale = 2
-
-
-        image = image.resize(
-
-            (
-
-                width * scale,
-
-                height * scale
-
-            )
-
-        )
-
-
-    image = ImageOps.grayscale(image)
-
-
-    image = ImageEnhance.Contrast(image).enhance(2.5)
-
-
-    image = ImageEnhance.Sharpness(image).enhance(2)
-
-
-    image = image.filter(
-
-        ImageFilter.SHARPEN
-
+    image = image.resize(
+        (new_width, new_height)
     )
+
+
+    # Enhance contrast
+    enhancer = ImageEnhance.Contrast(image)
+
+    image = enhancer.enhance(2)
+
+
+    # Enhance sharpness
+    enhancer = ImageEnhance.Sharpness(image)
+
+    image = enhancer.enhance(2)
 
 
     return image
 
 
 # =========================================================
-# OCR FUNCTION
-# =========================================================
-
-def perform_ocr(image, mode):
-
-    try:
-
-
-        text = pytesseract.image_to_string(
-
-            image,
-
-            config=f"--oem 3 --psm {mode}"
-
-        )
-
-
-        return text
-
-
-    except Exception as e:
-
-
-        print(
-
-            f"OCR Error Mode {mode}: {e}"
-
-        )
-
-
-        return ""
-
-
-# =========================================================
-# OCR IMAGE WITH MULTIPLE METHODS
-# =========================================================
-
-def extract_amount_from_image(image):
-
-
-    processed = preprocess_image(image)
-
-
-    all_candidates = []
-
-
-    # =====================================================
-    # FULL IMAGE OCR MODE 6
-    # =====================================================
-
-    print("\nRunning OCR Mode 6...")
-
-
-    text_6 = perform_ocr(
-
-        processed,
-
-        6
-
-    )
-
-
-    print("\n========== OCR MODE 6 ==========")
-
-    print(text_6)
-
-    print("================================")
-
-
-    all_candidates.extend(
-
-        extract_candidates(
-
-            text_6,
-
-            False
-
-        )
-
-    )
-
-
-    # =====================================================
-    # FULL IMAGE OCR MODE 11
-    # =====================================================
-
-    print("\nRunning OCR Mode 11...")
-
-
-    text_11 = perform_ocr(
-
-        processed,
-
-        11
-
-    )
-
-
-    print("\n========== OCR MODE 11 ==========")
-
-    print(text_11)
-
-    print("=================================")
-
-
-    all_candidates.extend(
-
-        extract_candidates(
-
-            text_11,
-
-            False
-
-        )
-
-    )
-
-
-    width, height = processed.size
-
-
-    # =====================================================
-    # TOP 50% OCR
-    # =====================================================
-
-    top_image = processed.crop(
-
-        (
-
-            0,
-
-            0,
-
-            width,
-
-            int(height * 0.50)
-
-        )
-
-    )
-
-
-    print("\nRunning TOP AREA OCR...")
-
-
-    top_text = perform_ocr(
-
-        top_image,
-
-        6
-
-    )
-
-
-    print("\n========== TOP OCR ==========")
-
-    print(top_text)
-
-    print("=============================")
-
-
-    all_candidates.extend(
-
-        extract_candidates(
-
-            top_text,
-
-            True
-
-        )
-
-    )
-
-
-    # =====================================================
-    # TOP 35% OCR MODE 11
-    # =====================================================
-
-    top_small = processed.crop(
-
-        (
-
-            0,
-
-            0,
-
-            width,
-
-            int(height * 0.35)
-
-        )
-
-    )
-
-
-    print("\nRunning TOP SMALL OCR...")
-
-
-    top_small_text = perform_ocr(
-
-        top_small,
-
-        11
-
-    )
-
-
-    all_candidates.extend(
-
-        extract_candidates(
-
-            top_small_text,
-
-            True
-
-        )
-
-    )
-
-
-    return select_best_amount(
-
-        all_candidates
-
-    )
-
-
-# =========================================================
-# UNIVERSAL AMOUNT EXTRACTOR
+# EXTRACT AMOUNT
 # =========================================================
 
 def extract_amount(image_url):
 
     try:
 
-
-        print("\n")
-
+        print("")
         print("========================================")
-
-        print("DOWNLOADING PAYMENT SCREENSHOT")
-
+        print("STARTING PAYMENT OCR")
         print("========================================")
 
 
-        response = requests.get(
+        image = download_image(image_url)
 
-            image_url,
 
-            timeout=30
+        image = preprocess_image(image)
+
+
+        # Different OCR modes
+        psm_modes = [
+
+            6,
+            11,
+            12
+
+        ]
+
+
+        all_text = ""
+
+
+        for mode in psm_modes:
+
+            try:
+
+                print(
+                    f"Running OCR Mode {mode}..."
+                )
+
+
+                text = pytesseract.image_to_string(
+
+                    image,
+
+                    config=f'--psm {mode}'
+
+                )
+
+
+                print("")
+                print(
+                    f"========== OCR MODE {mode} =========="
+                )
+
+                print(text)
+
+                print(
+                    "======================================"
+                )
+
+
+                all_text += "\n" + text
+
+
+                amount = find_amount_from_text(text)
+
+
+                if amount:
+
+                    print(
+                        f"FINAL AMOUNT FOUND: {amount}"
+                    )
+
+                    return amount
+
+
+            except Exception as e:
+
+                print(
+                    f"OCR Error Mode {mode}: {e}"
+                )
+
+
+        # Final search in combined text
+
+        amount = find_amount_from_text(
+            all_text
+        )
+
+
+        if amount:
+
+            return amount
+
+
+        # =================================================
+        # FALLBACK:
+        # Find large numbers from OCR
+        # =================================================
+
+        numbers = re.findall(
+
+            r'(?<![A-Za-z0-9])(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d{3,9}(?:\.\d{1,2})?)(?![A-Za-z0-9])',
+
+            all_text
 
         )
 
 
-        response.raise_for_status()
+        valid_numbers = []
 
 
-        image = Image.open(
+        for number in numbers:
 
-            io.BytesIO(response.content)
-
-        )
+            amount = clean_amount(number)
 
 
-        print(
+            if is_valid_amount(amount):
 
-            f"Image Size: {image.size}"
+                value = float(amount)
 
-        )
+                # Ignore probable years
+                if 2000 <= value <= 2100:
 
-
-        amount, score = extract_amount_from_image(
-
-            image
-
-        )
+                    continue
 
 
-        if not amount:
-
-            print("FINAL RESULT: NOT FOUND")
-
-            return "NOT FOUND", 0
+                valid_numbers.append(value)
 
 
-        print("\n")
+        if valid_numbers:
 
-        print("========================================")
-
-        print(f"FINAL AMOUNT: {amount}")
-
-        print(f"CONFIDENCE SCORE: {score}")
-
-        print("========================================")
+            # Screenshot ma usually largest payment amount hoy
+            best_amount = max(valid_numbers)
 
 
-        return amount, score
+            if best_amount.is_integer():
+
+                best_amount = str(
+                    int(best_amount)
+                )
+
+            else:
+
+                best_amount = str(best_amount)
+
+
+            print(
+                f"FALLBACK AMOUNT FOUND: {best_amount}"
+            )
+
+
+            return best_amount
+
+
+        print("FINAL RESULT: NOT FOUND")
+
+
+        return "NOT FOUND"
 
 
     except Exception as e:
 
+        print(
+            f"FINAL OCR ERROR: {e}"
+        )
 
-        print("\n")
-
-        print("========================================")
-
-        print("UNIVERSAL OCR ERROR")
-
-        print(str(e))
-
-        print("========================================")
-
-
-        return "NOT FOUND", 0
+        return "NOT FOUND"
 
 
 # =========================================================
-# CONFIDENCE STATUS
-# =========================================================
-
-def get_status(score):
-
-
-    if score >= 700:
-
-        return "VERIFIED"
-
-
-    elif score >= 400:
-
-        return "LIKELY"
-
-
-    elif score >= 100:
-
-        return "CHECK"
-
-
-    return "NOT FOUND"
-
-
-# =========================================================
-# GOOGLE SHEET ENTRY
+# GOOGLE SHEET - NEW ENTRY
 # =========================================================
 
 def send_to_google_sheet(
 
     party_name,
-
     amount,
-
-    confidence,
-
     screenshot_url,
-
     discord_user,
-
     message_id
 
 ):
 
-
     try:
 
-
-        status = get_status(confidence)
-
-
         data = {
+
+            "action": "new",
 
             "secret": SECRET_KEY,
 
             "partyName": party_name,
 
             "amount": amount,
-
-            "confidence": confidence,
-
-            "status": status,
 
             "screenshot": screenshot_url,
 
@@ -1150,11 +422,8 @@ def send_to_google_sheet(
         }
 
 
-        print("\n========== SENDING DATA ==========")
-
-        print(data)
-
-        print("==================================\n")
+        print("")
+        print("Sending NEW entry to Google Sheet...")
 
 
         response = requests.post(
@@ -1168,23 +437,98 @@ def send_to_google_sheet(
         )
 
 
-        print("\n========== GOOGLE SHEET RESPONSE ==========")
+        print(
+            "Google Sheet Response:"
+        )
 
-        print(f"Status Code: {response.status_code}")
+        print(
+            response.text
+        )
 
-        print(response.text)
 
-        print("============================================\n")
+        return True
 
 
     except Exception as e:
 
+        print(
+            f"Google Sheet Error: {e}"
+        )
+
+        return False
+
+
+# =========================================================
+# GOOGLE SHEET - UPDATE PARTY NAME
+# =========================================================
+
+def update_party_in_google_sheet(
+
+    party_name,
+    message_id,
+    discord_user
+
+):
+
+    try:
+
+        data = {
+
+            "action": "update_party",
+
+            "secret": SECRET_KEY,
+
+            "partyName": party_name,
+
+            "discordUser": discord_user,
+
+            "messageId": message_id
+
+        }
+
+
+        print("")
+        print("Updating Party Name in Google Sheet...")
 
         print(
+            f"New Party Name: {party_name}"
+        )
 
-            f"Google Sheet Error: {e}"
+        print(
+            f"Message ID: {message_id}"
+        )
+
+
+        response = requests.post(
+
+            GOOGLE_SCRIPT_URL,
+
+            json=data,
+
+            timeout=30
 
         )
+
+
+        print(
+            "Google Sheet Update Response:"
+        )
+
+        print(
+            response.text
+        )
+
+
+        return True
+
+
+    except Exception as e:
+
+        print(
+            f"Google Sheet Update Error: {e}"
+        )
+
+        return False
 
 
 # =========================================================
@@ -1194,39 +538,24 @@ def send_to_google_sheet(
 @client.event
 async def on_ready():
 
-
-    print("\n")
-
-    print("========================================")
-
+    print("")
+    print("======================================")
     print("🤖 DISCORD PAYMENT BOT ACTIVE")
-
-    print("========================================")
-
-    print(f"Bot Name: {client.user}")
-
-    print(f"Bot ID: {client.user.id}")
-
-    print(f"Servers: {len(client.guilds)}")
-
-    print("========================================")
-
-    print("\n")
-
-
-# =========================================================
-# BOT JOIN SERVER
-# =========================================================
-
-@client.event
-async def on_guild_join(guild):
-
+    print("======================================")
 
     print(
-
-        f"Joined Server: {guild.name}"
-
+        f"Bot Name: {client.user}"
     )
+
+    print(
+        f"Bot ID: {client.user.id}"
+    )
+
+    print(
+        f"Servers: {len(client.guilds)}"
+    )
+
+    print("======================================")
 
 
 # =========================================================
@@ -1237,114 +566,96 @@ async def on_guild_join(guild):
 async def on_message(message):
 
 
-    # Ignore bot messages
+    # Bot messages ignore
 
     if message.author.bot:
 
         return
 
 
-    # Ignore message without attachment
+    # Screenshot nathi
 
     if not message.attachments:
 
         return
 
 
-    # Party name
+    # Party Name
 
     party_name = message.content.strip()
 
 
     if not party_name:
 
-
-        print("❌ PARTY NAME MISSING")
-
+        print("Party Name Missing")
 
         return
 
 
-    print("\n\n")
+    print("")
+    print("======================================")
+    print("NEW PAYMENT MESSAGE DETECTED")
+    print("======================================")
 
-    print("========================================")
+    print(
+        f"Party Name: {party_name}"
+    )
 
-    print("📩 NEW PAYMENT MESSAGE DETECTED")
+    print(
+        f"User: {message.author}"
+    )
 
-    print("========================================")
+    print(
+        f"Message ID: {message.id}"
+    )
 
-    print(f"Party Name: {party_name}")
+    print(
+        f"Attachments: {len(message.attachments)}"
+    )
 
-    print(f"Discord User: {message.author}")
-
-    print(f"Message ID: {message.id}")
-
-    print(f"Attachments: {len(message.attachments)}")
-
-    print("========================================")
+    print("======================================")
 
 
-    # Process attachments
+    # All attachments
 
     for attachment in message.attachments:
 
 
-        print("\n")
-
-        print(
-
-            f"Processing: {attachment.filename}"
-
-        )
-
+        # Image check
 
         is_image = False
 
 
-        # Discord content type check
-
         if attachment.content_type:
 
-
-            if attachment.content_type.startswith("image"):
+            if attachment.content_type.startswith(
+                "image"
+            ):
 
                 is_image = True
 
 
-        # Backup extension check
+        # File extension fallback
 
         filename = attachment.filename.lower()
 
 
-        if filename.endswith(
+        image_extensions = (
 
-            (
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".webp"
 
-                ".jpg",
+        )
 
-                ".jpeg",
 
-                ".png",
-
-                ".webp"
-
-            )
-
-        ):
-
+        if filename.endswith(image_extensions):
 
             is_image = True
 
 
         if not is_image:
-
-
-            print(
-
-                "Skipping non-image file"
-
-            )
-
 
             continue
 
@@ -1353,26 +664,13 @@ async def on_message(message):
 
 
         print(
-
-            f"Screenshot URL: {screenshot_url}"
-
+            f"Processing: {filename}"
         )
 
 
-        # =================================================
-        # OCR PROCESS
-        # =================================================
+        # OCR BLOCKING HOY ETLE THREAD MA RUN KARO
 
-        print(
-
-            "Starting OCR..."
-
-        )
-
-
-        # Run blocking OCR separately
-
-        amount, confidence = await asyncio.to_thread(
+        amount = await asyncio.to_thread(
 
             extract_amount,
 
@@ -1381,33 +679,12 @@ async def on_message(message):
         )
 
 
-        status = get_status(confidence)
+        print(
+            f"FINAL PAYMENT AMOUNT: {amount}"
+        )
 
 
-        print("\n")
-
-        print("========================================")
-
-        print("FINAL PAYMENT RESULT")
-
-        print("========================================")
-
-        print(f"Party: {party_name}")
-
-        print(f"Amount: {amount}")
-
-        print(f"Confidence: {confidence}")
-
-        print(f"Status: {status}")
-
-        print("========================================")
-
-        print("\n")
-
-
-        # =================================================
-        # SEND TO GOOGLE SHEET
-        # =================================================
+        # Google Sheet entry
 
         await asyncio.to_thread(
 
@@ -1416,8 +693,6 @@ async def on_message(message):
             party_name,
 
             amount,
-
-            confidence,
 
             screenshot_url,
 
@@ -1428,22 +703,150 @@ async def on_message(message):
         )
 
 
+        # Only first screenshot process
+
+        break
+
+
+# =========================================================
+# MESSAGE EDIT DETECTION
+# =========================================================
+
+@client.event
+async def on_message_edit(before, after):
+
+
+    # Bot messages ignore
+
+    if after.author.bot:
+
+        return
+
+
+    # Party name change check
+
+    old_party_name = before.content.strip()
+
+    new_party_name = after.content.strip()
+
+
+    # Same text hoy to kai karvanu nahi
+
+    if old_party_name == new_party_name:
+
+        return
+
+
+    # New name blank hoy to ignore
+
+    if not new_party_name:
+
+        print(
+            "Edited Party Name is blank"
+        )
+
+        return
+
+
+    print("")
+    print("======================================")
+    print("MESSAGE EDIT DETECTED")
+    print("======================================")
+
+    print(
+        f"OLD PARTY: {old_party_name}"
+    )
+
+    print(
+        f"NEW PARTY: {new_party_name}"
+    )
+
+    print(
+        f"MESSAGE ID: {after.id}"
+    )
+
+    print(
+        f"USER: {after.author}"
+    )
+
+    print("======================================")
+
+
+    # Google Sheet update
+
+    result = await asyncio.to_thread(
+
+        update_party_in_google_sheet,
+
+        new_party_name,
+
+        str(after.id),
+
+        str(after.author)
+
+    )
+
+
+    if result:
+
+        print(
+            "PARTY NAME UPDATED SUCCESSFULLY"
+        )
+
+    else:
+
+        print(
+            "PARTY NAME UPDATE FAILED"
+        )
+
+
+# =========================================================
+# MESSAGE DELETE LOG
+# =========================================================
+
+@client.event
+async def on_message_delete(message):
+
+
+    if message.author.bot:
+
+        return
+
+
+    if not message.attachments:
+
+        return
+
+
+    print("")
+    print("======================================")
+    print("PAYMENT MESSAGE DELETED")
+    print("======================================")
+
+    print(
+        f"Party: {message.content}"
+    )
+
+    print(
+        f"Message ID: {message.id}"
+    )
+
+    print(
+        f"Deleted By/Author: {message.author}"
+    )
+
+    print("======================================")
+
+
 # =========================================================
 # START BOT
 # =========================================================
 
 if __name__ == "__main__":
 
-
-    print("\n")
-
-    print("========================================")
-
-    print("STARTING UNIVERSAL PAYMENT BOT")
-
-    print("========================================")
-
-    print("\n")
-
+    print("")
+    print("======================================")
+    print("Starting Discord Payment Bot...")
+    print("======================================")
 
     client.run(DISCORD_TOKEN)
